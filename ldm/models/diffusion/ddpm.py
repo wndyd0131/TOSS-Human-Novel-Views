@@ -19,6 +19,7 @@ from tqdm import tqdm
 from torchvision.utils import make_grid
 from pytorch_lightning.utilities.distributed import rank_zero_only
 from omegaconf import ListConfig
+import torch.nn.functional as F
 
 from ldm.util import log_txt_as_img, exists, default, ismap, isimage, mean_flat, count_params, instantiate_from_config
 from ldm.modules.ema import LitEma
@@ -95,6 +96,34 @@ class DDPM(pl.LightningModule):
         self.channels = channels
         self.use_positional_encodings = use_positional_encodings
         self.model = DiffusionWrapper(unet_config, conditioning_key)
+
+        # #@
+        # from peft import get_peft_model, LoraConfig
+
+        # lora_config = LoraConfig(
+        #     r=8,
+        #     lora_alpha=16,
+        #     target_modules=[
+        #         "middle_block.1.transformer_blocks.0.attn2.to_q",
+        #         "middle_block.1.transformer_blocks.0.attn2.to_k",
+        #         "middle_block.1.transformer_blocks.0.attn2.to_v",
+        #         "output_blocks.3.1.transformer_blocks.0.attn2.to_q",
+        #         "output_blocks.3.1.transformer_blocks.0.attn2.to_k",
+        #         "output_blocks.3.1.transformer_blocks.0.attn2.to_v"
+        #     ],
+        #     lora_dropout=0.05,
+        #     bias="none"
+        # )
+
+        # self.model.diffusion_model = get_peft_model(self.model.diffusion_model, lora_config)
+
+        # for name, param in self.model.named_parameters():
+        #     param.requires_grad = False
+        # for name, param in self.model.named_parameters():
+        #     if "lora" in name.lower():
+        #         param.requires_grad = True
+        # #!
+
         count_params(self.model, verbose=True)
         self.use_ema = use_ema
         if self.use_ema:
@@ -445,6 +474,11 @@ class DDPM(pl.LightningModule):
         return loss, loss_dict
 
     def training_step(self, batch, batch_idx):
+        # imgs = batch["image"]
+        # output = self.model(imgs)
+        # loss = F.mse_loss(output, imgs)
+        # return loss
+
         for k in self.ucg_training:
             p = self.ucg_training[k]["p"]
             val = self.ucg_training[k]["val"]
@@ -624,7 +658,7 @@ class LatentDiffusion(DDPM):
 
     @rank_zero_only
     @torch.no_grad()
-    def on_train_batch_start(self, batch, batch_idx, dataloader_idx):
+    def on_train_batch_start(self, batch, batch_idx, dataloader_idx=0):
         # only for very first batch
         if self.scale_by_std and self.current_epoch == 0 and self.global_step == 0 and batch_idx == 0 and not self.restarted_from_ckpt:
             assert self.scale_factor == 1., 'rather not use custom rescaling and std-rescaling simultaneously'
@@ -1391,8 +1425,9 @@ class LatentDiffusion(DDPM):
             checkpoint.clear()
 
         if os.path.isdir(self.trainer.checkpoint_callback.dirpath):
-            self.embedding_manager.save(os.path.join(self.trainer.checkpoint_callback.dirpath, "embeddings.pt"))
-            self.embedding_manager.save(os.path.join(self.trainer.checkpoint_callback.dirpath, f"embeddings_gs-{self.global_step}.pt"))
+            if self.embedding_manager is not None:
+                self.embedding_manager.save(os.path.join(self.trainer.checkpoint_callback.dirpath, "embeddings.pt"))
+                self.embedding_manager.save(os.path.join(self.trainer.checkpoint_callback.dirpath, f"embeddings_gs-{self.global_step}.pt"))
 
 
 class DiffusionWrapper(pl.LightningModule):

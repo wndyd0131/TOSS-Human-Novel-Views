@@ -160,5 +160,8 @@ cython_debug/
 #.idea/
 
 gradio_res/
-ckpt/toss.ckpt
+ckpt/
+checkpoints/
 exp/
+examples/
+datasets/

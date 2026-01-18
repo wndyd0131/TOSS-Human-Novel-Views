@@ -248,8 +248,12 @@ def get_T_from_relative(x, y, z, pose_enc="freq")->torch.Tensor:
 
 def load_model(device, _hparams, sd_locked, only_mid_control, cfgs):
     model = instantiate_from_config(cfgs.model)
-    model.load_state_dict(load_state_dict(_hparams.resume_path, location='cpu'))
+    print("13")
+
+    model.load_state_dict(load_state_dict(_hparams.resume_path, location='cpu'), strict=False)
     # reweight noise scheduer
+    print("14")
+
     if _hparams.register_scheduler:
         model.register_schedule(given_betas=None, beta_schedule="linear", timesteps=1000, linear_start=0.00085, linear_end=0.016)
     model.learning_rate = _hparams.lr
@@ -318,6 +322,7 @@ def save_gif(save_dir):
     return os.path.join(save_dir, 'look_around.gif')
 
 if __name__ == '__main__':
+    print("11")
     hparams = get_opts()
     sd_locked = True
     only_mid_control = False
@@ -331,6 +336,7 @@ if __name__ == '__main__':
     pose_enc = hparams.pose_enc
     ddim_steps = 75
     ddim_eta = 1.0
+    print("12")
 
     # set config
     cfgs = OmegaConf.load(hparams.model_cfg)
@@ -338,8 +344,11 @@ if __name__ == '__main__':
     os.makedirs(GRADIO_RES_DIR, exist_ok=True)
     # Load model
     # First use cpu to load models. Pytorch Lightning will automatically move it to GPUs.
+
     model = load_model(device, hparams, sd_locked, only_mid_control, cfgs)
     # build model
+    print("13")
+
     sampler = DDIMSampler(model)
     
     # init segmentor
@@ -393,5 +402,6 @@ if __name__ == '__main__':
             inputs=[out_folder],
             outputs=gif_display
         )
+    print("EXECUTION")
     demo.queue()    
     demo.launch(share=True, server_name="0.0.0.0", server_port=8501)

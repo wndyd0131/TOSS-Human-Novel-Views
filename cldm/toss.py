@@ -39,7 +39,23 @@ class TOSS(LatentDiffusion):
 
     @torch.no_grad()
     def get_input(self, batch, k, bs=None, training=True, *args, **kwargs):
-        x, c = super().get_input(batch, self.first_stage_key, *args, **kwargs)
+        # x, c = super().get_input(batch, self.first_stage_key, *args, **kwargs)
+        x = batch[self.first_stage_key]
+        x = x.to(self.device)
+
+        # only permute if HWC
+        if x.ndim == 4 and x.shape[-1] == 3:
+            x = einops.rearrange(x, 'b h w c -> b c h w')
+
+        x_in = x * 2.0 - 1.0
+        encoder_posterior = self.encode_first_stage(x_in)
+        x = self.get_first_stage_encoding(encoder_posterior).detach()
+
+        c = batch.get(self.cond_stage_key, None)
+
+        print("get_input raw control:", batch[self.control_key].shape)
+        # self.print("get_input raw control:", batch[self.control_key].shape)
+
         # camera pose
         delta_pose = batch['delta_pose']
         delta_pose = delta_pose.to(self.device)
@@ -49,8 +65,9 @@ class TOSS(LatentDiffusion):
         control = batch[self.control_key]
         if bs is not None:
             control = control[:bs]
-        control = control.to(self.device)       
-        control = einops.rearrange(control, 'b h w c -> b c h w')
+        control = control.to(self.device)
+        if control.ndim == 4 and control.shape[-1] == 3:
+            control = einops.rearrange(control, 'b h w c -> b c h w')
         control = control.to(memory_format=torch.contiguous_format).float()
 
         # encode
@@ -64,7 +81,8 @@ class TOSS(LatentDiffusion):
 
             # z.shape: [8, 4, 64, 64]; c.shape: [8, 1, 768]
             # c: should be [b, 77, 768]
-            if isinstance(c, list) and isinstance(c[0], str):
+            # if isinstance(c, list) and isinstance(c[0], str):
+            if not torch.is_tensor(c):
                 c = self.get_learned_conditioning(c)
             with torch.enable_grad():
                 null_prompt = self.get_learned_conditioning([""]).detach()
@@ -81,16 +99,64 @@ class TOSS(LatentDiffusion):
                 c = self.get_learned_conditioning(c)
 
         return x, dict(c_crossattn=[c], c_concat=[control], delta_pose=delta_pose, in_concat=[concat])
-
+    
     def apply_model(self, x_noisy, t, cond:Dict, *args, **kwargs):
         assert isinstance(cond, dict)
         diffusion_model = self.model.diffusion_model
         cond_txt = torch.cat(cond['c_crossattn'], 1)
+        # eps = diffusion_model(
+        #     x=x_noisy,                      # ✅ keep 4 channels
+        #     timesteps=t,
+        #     context=cond_txt,
+        #     delta_pose=cond["delta_pose"],
+        #     in_concat=cond["in_concat"][0], # ✅ pass separately
+        # )
+
+
         eps = diffusion_model(x=torch.cat([x_noisy] + cond['in_concat'], dim=0), \
                 timesteps=t, context=cond_txt, delta_pose=cond['delta_pose'])
 
         return eps
-    
+
+    def apply_model(self, x_noisy, t, cond, *args, **kwargs):
+        assert isinstance(cond, dict)
+        diffusion_model = self.model.diffusion_model
+
+        # DDIM may call us with B=1 (no CFG) or B=2 (CFG)
+        B = x_noisy.shape[0]
+
+        def match_B(x):
+            if not torch.is_tensor(x):
+                return x
+            if x.shape[0] == B:
+                return x
+            if x.shape[0] == 1:
+                reps = [B] + [1] * (x.dim() - 1)
+                return x.repeat(*reps)
+            return x[:B]
+
+        # ---- make all cond pieces batch=B first ----
+        cond_txt = cond["c_crossattn"][0]         # [B, 77, 768] typically
+        cond_txt = match_B(cond_txt)
+
+        delta_pose = match_B(cond["delta_pose"])  # [B, ...]
+        in_concat  = match_B(cond["in_concat"][0])# [B, 4, 32, 32]
+
+        # ---- build the paired batch (2B) ----
+        x_in = torch.cat([x_noisy, in_concat], dim=0)   # [2B, 4, 32, 32]
+        t_in = torch.cat([t, t], dim=0)                 # [2B]
+        ctx  = torch.cat([cond_txt, cond_txt], dim=0)   # [2B, 77, 768]
+        pose = torch.cat([delta_pose, delta_pose], dim=0)
+
+        eps = diffusion_model(
+            x=x_in,
+            timesteps=t_in,
+            context=ctx,
+            delta_pose=pose,
+        )
+        return eps
+
+
     def get_learned_conditioning(self, c):
         if self.cond_stage_forward is None:
             if hasattr(self.cond_stage_model, 'encode') and callable(self.cond_stage_model.encode):
@@ -243,32 +309,35 @@ class TOSS(LatentDiffusion):
             else: # otherwise, only optimize the embeddings
                 opt = torch.optim.AdamW(embedding_params, lr=lr)
         else:
-            if not self.sd_locked:
-                params += list(self.model.diffusion_model.output_blocks.parameters())
-                params += list(self.model.diffusion_model.out.parameters())
+            # ✅ LoRA-only branch
+            lora_params = [p for n, p in self.named_parameters()
+                        if p.requires_grad and ("lora" in n.lower())]
+            if len(lora_params) == 0:
+                raise RuntimeError("No LoRA params found. Did you inject LoRA and set requires_grad?")
+            opt = torch.optim.AdamW(lora_params, lr=lr)
 
-            # get cross attn
-            model_params = []
-            cross_attn_params = []
-            pose_net = []
-            for n, m in self.model.named_parameters(): 
-                if 'attn1' in n or 'attn_mid' in n:
-                    cross_attn_params.append(m)
-                    print(n)
-                elif 'pose_net' in n:
-                    pose_net.append(m)
-                    print(n)
-                else:
-                    model_params.append(m)
+            # # get cross attn
+            # model_params = []
+            # cross_attn_params = []
+            # pose_net = []
+            # for n, m in self.model.named_parameters(): 
+            #     if 'attn1' in n or 'attn_mid' in n:
+            #         cross_attn_params.append(m)
+            #         print(n)
+            #     elif 'pose_net' in n:
+            #         pose_net.append(m)
+            #         print(n)
+            #     else:
+            #         model_params.append(m)
             
-            if self.finetune:
-                opt = torch.optim.AdamW([{"params": model_params, "lr": lr},
-                            {"params": cross_attn_params, "lr": lr},
-                            {"params": pose_net, "lr": lr},], lr=lr)
-            else:
-                opt = torch.optim.AdamW([{"params": model_params, "lr": lr},
-                                {"params": cross_attn_params, "lr": lr*2},
-                                {"params": pose_net, "lr": lr*10},], lr=lr)
+            # if self.finetune:
+            #     opt = torch.optim.AdamW([{"params": model_params, "lr": lr},
+            #                 {"params": cross_attn_params, "lr": lr},
+            #                 {"params": pose_net, "lr": lr},], lr=lr)
+            # else:
+            #     opt = torch.optim.AdamW([{"params": model_params, "lr": lr},
+            #                     {"params": cross_attn_params, "lr": lr*2},
+            #                     {"params": pose_net, "lr": lr*10},], lr=lr)
         
         if self.use_scheduler:
             assert 'target' in self.scheduler_config

@@ -119,12 +119,14 @@ class CheckpointFunction(torch.autograd.Function):
     def forward(ctx, run_function, length, *args):
         ctx.run_function = run_function
         ctx.input_tensors = list(args[:length])
-        ctx.input_params = list(args[length:])
+        # 🔥 FIX: only keep params that require grad
+        ctx.input_params = [p for p in args[length:] if p.requires_grad]
         ctx.gpu_autocast_kwargs = {"enabled": torch.is_autocast_enabled(),
                                    "dtype": torch.get_autocast_gpu_dtype(),
                                    "cache_enabled": torch.is_autocast_cache_enabled()}
         with torch.no_grad():
             output_tensors = ctx.run_function(*ctx.input_tensors)
+        ctx.output_tensors = output_tensors
         return output_tensors
 
     @staticmethod
@@ -147,6 +149,8 @@ class CheckpointFunction(torch.autograd.Function):
         del ctx.input_params
         del output_tensors
         return (None, None) + input_grads
+    
+
 
 
 def timestep_embedding(timesteps, dim, max_period=10000, repeat_only=False):

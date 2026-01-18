@@ -248,6 +248,7 @@ class ResBlock(TimestepBlock):
         :param x: an [N x C x ...] Tensor of features.
         :param emb: an [N x emb_channels] Tensor of timestep embeddings.
         :return: an [N x C x ...] Tensor of outputs.
+        H: torch.Size([2, 320, 32, 32])  EMB: torch.Size([4, 1280])
         """
         return checkpoint(
             self._forward, (x, emb), self.parameters(), self.use_checkpoint
@@ -255,6 +256,7 @@ class ResBlock(TimestepBlock):
 
 
     def _forward(self, x, emb):
+        print("X:", x.shape)
         if self.updown:
             in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
             h = in_rest(x)
@@ -272,6 +274,7 @@ class ResBlock(TimestepBlock):
             h = out_norm(h) * (1 + scale) + shift
             h = out_rest(h)
         else:
+            print("H:", h.shape, " EMB:", emb.shape)
             h = h + emb_out
             h = self.out_layers(h)
         return self.skip_connection(x) + h
