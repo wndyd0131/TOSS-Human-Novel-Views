@@ -163,5 +163,5 @@ gradio_res/
 ckpt/
 checkpoints/
 exp/
-examples/
 datasets/
+copy/

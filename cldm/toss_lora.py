@@ -2,6 +2,7 @@ import torch
 from cldm.toss import TOSS
 from peft import get_peft_model, LoraConfig
 import torch.nn.functional as F
+from torch import nn
 
 class TossLoraModule(TOSS):
     def __init__(self, lora_config_params, *args, **kwargs):
@@ -11,6 +12,13 @@ class TossLoraModule(TOSS):
 
         # # Turn off checkpointing manually
         # internal_unet.use_checkpoint = False
+
+        # Change pose_net in_feature channel from 51 to 16
+        self.model.diffusion_model.pose_net = nn.Sequential(
+            nn.Linear(16, 320), # 51 -> 16
+            nn.SiLU(),
+            nn.Linear(320, 320)
+        )
 
         unet = self.model.diffusion_model
         def disable_all_ckpt(m):
@@ -29,6 +37,11 @@ class TossLoraModule(TOSS):
 
         for n, p in self.model.diffusion_model.named_parameters():
             if "pose_net" in n:
+                p.requires_grad = True
+
+        for n, p in self.model.diffusion_model.named_parameters():
+            # print(n)
+            if "base_model.model.out." in n:
                 p.requires_grad = True
 
         # Posenet
@@ -63,19 +76,24 @@ class TossLoraModule(TOSS):
         target = noise
 
         # MSE
-        loss_simple = (model_output - target) ** 2
+        loss = (model_output - target) ** 2
+
+        # if torch.rand(1) < 0.1:
+        #     cond['in_concat'][0] = torch.zeros_like(cond['in_concat'][0])
+
+        # loss, loss_dict = self.forward(x, cond)
+
 
         mask = batch.get("mask") # Original mask [B, 1, 256, 256]
-
         # Latent mask
         if mask is not None:
-            latent_mask = F.interpolate(mask, size=loss_simple.shape[-2:], mode="area")
+            latent_mask = F.interpolate(mask, size=loss.shape[-2:], mode="area")
             
-            loss_simple = loss_simple * latent_mask
+            loss = loss * latent_mask
             
-            loss = loss_simple.sum() / (latent_mask.sum() + 1e-8)
+            loss = loss.sum() / (latent_mask.sum() + 1e-8)
         else:
-            loss = loss_simple.mean()
+            loss = loss.mean()
 
         # loss, loss_dict = self.shared_step(batch)
 
@@ -90,3 +108,10 @@ class TossLoraModule(TOSS):
         trainable_params = [p for p in self.model.diffusion_model.parameters() if p.requires_grad]
 
         return torch.optim.AdamW(trainable_params, lr=self.learning_rate)
+        # lora_params = [p for n, p in self.named_parameters() if "lora" in n and p.requires_grad]
+        # pose_params = [p for n, p in self.named_parameters() if "pose_net" in n and p.requires_grad]
+
+        # return torch.optim.AdamW([
+        #     {"params": lora_params, "lr": 1e-4}, 
+        #     {"params": pose_params, "lr": 1e-3} # 10x faster learning for 3D parameters
+        # ])

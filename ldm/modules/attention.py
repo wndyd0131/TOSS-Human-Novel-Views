@@ -552,6 +552,11 @@ class BasicTransformerBlock_vae(nn.Module):
         x_cond = x[batch_size//2:,...]
         x = x[:batch_size//2,...]
 
+        pos_proj = self.vae_proj(pos_emb)
+
+        print("x_cond:", x_cond.shape)
+        print("pos_proj:", pos_proj.shape)
+
         # cross attn between cond and target
         # x_cross = torch.cat([x_cond, pos_emb.repeat(1,1,x.shape[-1]//320)], dim=-2)
         x_cross = torch.cat([x_cond, self.vae_proj(pos_emb)], dim=-2)

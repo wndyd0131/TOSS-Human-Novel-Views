@@ -1,9 +1,10 @@
 model:
   target: cldm.toss_lora.TossLoraModule
+  # target: cldm.toss.TOSS
   params:
     lora_config_params:
-        r: 8
-        lora_alpha: 16
+        r: 32
+        lora_alpha: 32
         target_modules: [
             "middle_block.1.transformer_blocks.0.attn2.to_q",
             "middle_block.1.transformer_blocks.0.attn2.to_k",
@@ -63,6 +64,7 @@ model:
         legacy: False
         temp_attn: "CA_vae"
         pose_enc: "vae"
+        # pose_enc: "identity"
 
     first_stage_config:
       target: ldm.models.autoencoder.AutoencoderKL

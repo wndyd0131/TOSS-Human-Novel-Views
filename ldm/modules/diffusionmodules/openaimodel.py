@@ -248,7 +248,8 @@ class ResBlock(TimestepBlock):
         :param x: an [N x C x ...] Tensor of features.
         :param emb: an [N x emb_channels] Tensor of timestep embeddings.
         :return: an [N x C x ...] Tensor of outputs.
-        H: torch.Size([2, 320, 32, 32])  EMB: torch.Size([4, 1280])
+        
+        current error state : H = torch.Size([2, 320, 32, 32])  EMB = torch.Size([4, 1280])
         """
         return checkpoint(
             self._forward, (x, emb), self.parameters(), self.use_checkpoint
@@ -1290,5 +1291,7 @@ class UNetModel_toss(nn.Module):
         h = h.type(x.dtype)
         if self.predict_codebook_ids:
             return self.id_predictor(h)[:x.shape[0]//2] if "CA" in self.temp_attn else self.id_predictor(h)
+            # return self.id_predictor(h)
         else:
             return self.out(h)[:x.shape[0]//2] if "CA" in self.temp_attn else self.out(h)
+            # return self.out(h)
