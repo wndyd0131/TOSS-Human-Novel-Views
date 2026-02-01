@@ -257,7 +257,7 @@ class ResBlock(TimestepBlock):
 
 
     def _forward(self, x, emb):
-        print("X:", x.shape)
+        # print("X:", x.shape)
         if self.updown:
             in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
             h = in_rest(x)
@@ -275,7 +275,7 @@ class ResBlock(TimestepBlock):
             h = out_norm(h) * (1 + scale) + shift
             h = out_rest(h)
         else:
-            print("H:", h.shape, " EMB:", emb.shape)
+            # print("H:", h.shape, " EMB:", emb.shape)
             h = h + emb_out
             h = self.out_layers(h)
         return self.skip_connection(x) + h

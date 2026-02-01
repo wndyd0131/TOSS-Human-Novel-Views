@@ -105,10 +105,10 @@ class TOSS(LatentDiffusion):
         diffusion_model = self.model.diffusion_model
         cond_txt = torch.cat(cond['c_crossattn'], 1)
 
-        print("X_noisy shape:", x_noisy.shape)
-        print("cond['in_concat'] shape:", cond['in_concat'][0].shape)
+        # print("X_noisy shape:", x_noisy.shape)
+        # print("cond['in_concat'] shape:", cond['in_concat'][0].shape)
         cat_x = torch.cat([x_noisy] + cond['in_concat'], dim=0)
-        print("cat_x shape:", cat_x.shape)
+        # print("cat_x shape:", cat_x.shape)
 
         # eps = diffusion_model(
         #     x=x_noisy,
