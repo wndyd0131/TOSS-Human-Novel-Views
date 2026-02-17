@@ -1045,7 +1045,9 @@ class UNetModel_toss(nn.Module):
                                 use_new_attention_order=use_new_attention_order,
                             ) if not use_spatial_transformer else SpatialTransformer_gate(
                                 ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim,
-                                disable_self_attn=disabled_sa, temp_attn=temp_attn, enable_gate_attn=False
+                                # disable_self_attn=disabled_sa, temp_attn=temp_attn, enable_gate_attn=False
+                                disable_self_attn=disabled_sa, temp_attn=temp_attn, enable_gate_attn=False,
+                                use_checkpoint=use_checkpoint
                             )
                         )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -1100,8 +1102,11 @@ class UNetModel_toss(nn.Module):
                 num_head_channels=dim_head,
                 use_new_attention_order=use_new_attention_order,
             ) if not use_spatial_transformer else SpatialTransformer_gate(  # always uses a self-attn
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim, \
-                                temp_attn=temp_attn, enable_gate_attn=False
+                            # ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim, \
+                            #     temp_attn=temp_attn, enable_gate_attn=False
+                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim,
+                            temp_attn=temp_attn, enable_gate_attn=False,
+                            use_checkpoint=use_checkpoint
                         ),
             ResBlock(
                 ch,
@@ -1153,8 +1158,11 @@ class UNetModel_toss(nn.Module):
                                 num_head_channels=dim_head,
                                 use_new_attention_order=use_new_attention_order,
                             ) if not use_spatial_transformer else SpatialTransformer_gate(
+                                # ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim,
+                                # disable_self_attn=disabled_sa, temp_attn=temp_attn, enable_gate_attn=False
                                 ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim,
-                                disable_self_attn=disabled_sa, temp_attn=temp_attn, enable_gate_attn=False
+                                temp_attn=temp_attn, enable_gate_attn=False,
+                                use_checkpoint=use_checkpoint
                             )
                         )
                 if level and i == self.num_res_blocks[level]:

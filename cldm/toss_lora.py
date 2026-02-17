@@ -5,24 +5,36 @@ import torch.nn.functional as F
 from torch import nn
 import wandb
 
-# Start a new wandb run to track this script.
-run = wandb.init(
-    # Set the wandb entity where your project will be logged (generally your team name).
-    entity="wndyd0131-sungkyunkwan-university",
-    # Set the wandb project where this run will be logged.
-    project="my-awesome-project",
-    # Track hyperparameters and run metadata.
-    config={
-        "learning_rate": 0.02,
-        "architecture": "CNN",
-        "dataset": "CIFAR-100",
-        "epochs": 10,
-    },
-)
+# CRITICAL FIX: Completely disable gradient checkpointing to fix LoRA gradient flow
+# The custom CheckpointFunction doesn't properly handle PEFT's dynamically added parameters
+import ldm.modules.diffusionmodules.util as ldm_util
+_original_checkpoint = ldm_util.checkpoint
+def _no_checkpoint(func, inputs, params, flag):
+    """Always bypass checkpointing - just run the function directly"""
+    return func(*inputs)
+ldm_util.checkpoint = _no_checkpoint
+print("[PATCH] Disabled gradient checkpointing in ldm_util.checkpoint")
 
+run = None
 class TossLoraModule(TOSS):
     def __init__(self, lora_config_params, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+        global run
+        run = wandb.init(
+            entity="wndyd0131-sungkyunkwan-university",
+            project="toss-lora",
+            config={
+                # LoRA config
+                "lora_r": lora_config_params.get("r", 16),
+                "lora_alpha": lora_config_params.get("lora_alpha", 16),
+                "lora_dropout": lora_config_params.get("lora_dropout", 0.0),
+                "target_modules": lora_config_params.get("target_modules", []),
+                # Model config
+                "architecture": "TOSS + LoRA",
+                "base_model": "Stable Diffusion UNet"
+            },
+        )
 
         # internal_unet = self.model.diffusion_model
 
@@ -36,12 +48,12 @@ class TossLoraModule(TOSS):
         #     nn.Linear(320, 320)
         # )
 
+        # Disable checkpoints
         unet = self.model.diffusion_model
         def disable_all_ckpt(m):
             for attr in ["use_checkpoint", "checkpoint", "use_checkpointing"]:
                 if hasattr(m, attr):
                     setattr(m, attr, False)
-
         unet.apply(disable_all_ckpt)
 
         # 1. Freeze the base model
@@ -51,16 +63,28 @@ class TossLoraModule(TOSS):
         peft_config = LoraConfig(**lora_config_params)
         self.model.diffusion_model = get_peft_model(self.model.diffusion_model, peft_config)
 
-        # # PoseNet
-        # for n, p in self.model.diffusion_model.named_parameters():
-        #     if "pose_net" in n:
-        #         p.requires_grad = True
-
-        # # Posenet
-        # for param in self.model.diffusion_model.pose_net.parameters():
-        #     param.requires_grad = True
+        # CRITICAL: Disable checkpointing AGAIN after PEFT wrapping
+        # PEFT changes module hierarchy, must ensure checkpointing is disabled
+        self.model.diffusion_model.apply(disable_all_ckpt)
         
-        # 3. Explicitly enable gradients for LoRA parameters (in case PEFT didn't)
+        # Verify checkpointing is disabled
+        ckpt_enabled_count = 0
+        for name, module in self.model.diffusion_model.named_modules():
+            if hasattr(module, 'checkpoint') and module.checkpoint:
+                ckpt_enabled_count += 1
+                print(f"[WARNING] Checkpointing still enabled on: {name}")
+        print(f"[INIT] Modules with checkpointing enabled: {ckpt_enabled_count}")
+
+        # 3. PoseNet
+        pose_net_count = 0
+        for n, p in self.model.diffusion_model.named_parameters():
+            if "pose_net" in n:
+                p.requires_grad = True
+                pose_net_count += 1
+                print(f"[INIT] Unfreezing pose_net param: {n}, shape={p.shape}")
+        print(f"[INIT] Unfroze {pose_net_count} pose_net parameters")
+        
+        # 4. Explicitly enable gradients for LoRA parameters (in case PEFT didn't)
         lora_count = 0
         lora_params_info = []
         for n, p in self.model.diffusion_model.named_parameters():
@@ -69,13 +93,15 @@ class TossLoraModule(TOSS):
                 lora_count += 1
                 lora_params_info.append((n, p.shape, p.requires_grad))
 
-                # CRITICAL FIX: Initialize lora_B with small non-zero values
-                # This prevents gradient attribution issues when lora_B is all zeros
-                if "lora_B" in n and p.abs().sum() == 0:
-                    print(f"[INIT] Fixing zero-initialized lora_B: {n}")
+                # Initialize lora_B with small but meaningful values
+                # This is essential for gradient flow - with lora_B=0, lora_A gets no gradients
+                if "lora_B" in n:
+                    print(f"[INIT] lora_B before init: {n}, mean={p.abs().mean().item():.6e}")
                     with torch.no_grad():
-                        # Initialize with small random values (like 1e-6 scale)
-                        p.normal_(mean=0.0, std=1e-6)
+                        # Use kaiming uniform like lora_A for balanced gradients
+                        nn.init.kaiming_uniform_(p, a=5**0.5)  # Same as lora_A default
+                        p.mul_(0.01)  # Scale down to not disrupt pretrained model too much
+                    print(f"[INIT] lora_B after init: {n}, mean={p.abs().mean().item():.6e}")
                         
             # Also enable output layers if needed
             if "base_model.model.out." in n:
@@ -95,6 +121,52 @@ class TossLoraModule(TOSS):
         
         # Debug: Check LoRA layer scaling and adapter status
         self._debug_lora_setup()
+        self._debug_pose_net_weights()
+
+    def _debug_pose_net_weights(self):
+        """Debug helper to inspect pose_net weights"""
+        print("\n[DEBUG] Pose Net Weight Analysis:")
+        
+        # Access pose_net (may be wrapped by PEFT)
+        unet = self.model.diffusion_model
+        pose_net = None
+        
+        # Try to find pose_net in the model
+        if hasattr(unet, 'base_model'):
+            # PEFT wrapped model
+            if hasattr(unet.base_model, 'model') and hasattr(unet.base_model.model, 'pose_net'):
+                pose_net = unet.base_model.model.pose_net
+        elif hasattr(unet, 'pose_net'):
+            pose_net = unet.pose_net
+        
+        if pose_net is None:
+            print("  [WARNING] pose_net not found!")
+            return
+        
+        print(f"  pose_net structure: {pose_net}")
+        print(f"  pose_enc type: {getattr(unet.base_model.model if hasattr(unet, 'base_model') else unet, 'pose_enc', 'unknown')}")
+        
+        # Iterate through pose_net layers
+        for name, param in pose_net.named_parameters():
+            print(f"\n  Layer: pose_net.{name}")
+            print(f"    shape: {param.shape}")
+            print(f"    requires_grad: {param.requires_grad}")
+            print(f"    mean: {param.data.mean().item():.6f}")
+            print(f"    std: {param.data.std().item():.6f}")
+            print(f"    min: {param.data.min().item():.6f}")
+            print(f"    max: {param.data.max().item():.6f}")
+            print(f"    abs_mean: {param.data.abs().mean().item():.6f}")
+            
+            # Check if weights look initialized (not all zeros)
+            if param.data.abs().sum() == 0:
+                print(f"    [WARNING] All zeros - may not be loaded properly!")
+            
+        # Print input/output dimensions
+        if hasattr(pose_net, '0') and hasattr(pose_net[0], 'in_features'):
+            print(f"\n  Input features (pose_net[0].in_features): {pose_net[0].in_features}")
+        if hasattr(pose_net, '2') and hasattr(pose_net[2], 'out_features'):
+            print(f"  Output features (pose_net[2].out_features): {pose_net[2].out_features}")
+
 
     def _register_lora_debug_hook(self):
         """Register hooks to debug LoRA forward pass"""
@@ -185,10 +257,22 @@ class TossLoraModule(TOSS):
         # checkpoint["state_dict"] = {k: v for k, v in checkpoint["state_dict"].items() if "lora" in k or "pose_net" in k}
         pass
 
+    def on_train_start(self):
+        """Called by PyTorch Lightning when training starts - log trainer config"""
+        if run is not None and self.trainer is not None:
+            run.config.update({
+                "max_epochs": self.trainer.max_epochs,
+                "max_steps": self.trainer.max_steps,
+                "batch_size": self.trainer.datamodule.batch_size if hasattr(self.trainer, 'datamodule') and self.trainer.datamodule else None,
+                "accumulate_grad_batches": self.trainer.accumulate_grad_batches,
+                "gradient_clip_val": self.trainer.gradient_clip_val,
+                "learning_rate": self.learning_rate,
+                # Training config from kwargs if available
+                "image_size": self.image_size,
+                "timesteps": self.num_timesteps,
+            }, allow_val_change=True)
+
     def training_step(self, batch, batch_idx):
-        # use of delta pose
-        # masking
-        # masked loss
 
         # Ensure model is in training mode
         self.model.diffusion_model.train()
@@ -206,10 +290,23 @@ class TossLoraModule(TOSS):
                     lora_active += 1
             print(f"[TRAIN] Found {lora_active} LoRA modules in forward path")
             
+            # CRITICAL: Verify LoRA weights are non-zero
+            for n, p in self.model.diffusion_model.named_parameters():
+                if "lora" in n.lower():
+                    print(f"[TRAIN] {n}: mean={p.abs().mean().item():.6e}, requires_grad={p.requires_grad}")
+            
+            # Check adapter state
+            if hasattr(self.model.diffusion_model, 'active_adapters'):
+                print(f"[TRAIN] Active adapters: {self.model.diffusion_model.active_adapters}")
+            if hasattr(self.model.diffusion_model, 'disable_adapters'):
+                print(f"[TRAIN] disable_adapters attr: {getattr(self.model.diffusion_model, 'disable_adapters', 'N/A')}")
+
             # Register a hook to check LoRA layer output
             self._register_lora_debug_hook()
 
         x, cond = self.get_input(batch, self.first_stage_key)
+
+        print("DEBUG_DELTA_POSE:", cond['delta_pose'][0])
 
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
         noise = torch.randn_like(x)
@@ -223,6 +320,9 @@ class TossLoraModule(TOSS):
 
         # MSE
         loss = (model_output - target) ** 2
+        print("LOSS shape 1:", loss.shape)
+        loss = F.mse_loss(model_output, target, reduction="mean")
+        print("LOSS shape 2:", loss.shape)
 
         # if torch.rand(1) < 0.1:
         #     cond['in_concat'][0] = torch.zeros_like(cond['in_concat'][0])
@@ -233,72 +333,169 @@ class TossLoraModule(TOSS):
         mask = batch.get("mask") # Original mask [B, 1, 256, 256]
         # Latent mask
         if mask is not None:
-            latent_mask = F.interpolate(mask, size=loss.shape[-2:], mode="area")
+            # latent_mask = F.interpolate(mask, size=loss.shape[-2:], mode="area")
+            latent_mask = F.interpolate(mask, size=model_output.shape[-2:], mode="area")
             
-            loss = loss * latent_mask
-            
-            loss = loss.sum() / (latent_mask.sum() + 1e-8)
+            # loss = loss * latent_mask
+            # loss = loss.sum() / (latent_mask.sum() + 1e-8)
+            loss = (F.mse_loss(model_output, noise, reduction="none") * latent_mask).sum() / (latent_mask.sum() + 1e-8)
         else:
             loss = loss.mean()
 
         run.log({"loss": loss})
+        print("LOSS_SHAPE:", loss.shape)
 
         if batch_idx % 500 == 0:
-            # Dec`ode
+            # Generate 4 multiview predictions from a single source image
             with torch.no_grad():
-                out = self.decode_first_stage(model_output)
-                out = torch.clamp((out + 1) / 2, 0, 1)
-                wandb_images = [
-                    wandb.Image(img, caption=f"Step {self.global_step}_Idx_{i}") 
-                    for i, img in enumerate(out)
-                ]
+                import math
                 
-                # 5. Log to the active run
-                run.log({"visual_predictions": wandb_images})
-        # loss, loss_dict = self.shared_step(batch)
-
-        # if mask is not None:
-        #     error = (loss_dict["pred_noise"] - loss_dict["target_noise"]) ** 2
-        #     loss = (error * mask).mean()
+                # Get one source image from batch
+                source_img = batch[self.control_key][:1].to(self.device)  # [1, C, H, W]
+                if source_img.ndim == 4 and source_img.shape[-1] == 3:
+                    source_img = source_img.permute(0, 3, 1, 2)
+                source_img_display = torch.clamp(source_img, 0, 1)
+                
+                # Encode source image to latent
+                source_latent = self.encode_first_stage(source_img * 2 - 1).mode().detach()
+                
+                # Get text conditioning (empty)
+                c_text = self.get_learned_conditioning([""])
+                
+                # Define 4 different yaw angles for multiview (in radians)
+                # e.g., -15°, -5°, +5°, +15°
+                yaw_angles_deg = [-15, -5, 5, 15]
+                
+                wandb_images = []
+                
+                # Add source image first
+                wandb_images.append(wandb.Image(
+                    source_img_display[0],
+                    caption=f"Step {self.global_step} | SOURCE"
+                ))
+                
+                # Generate prediction for each pose
+                for yaw_deg in yaw_angles_deg:
+                    yaw_rad = math.radians(yaw_deg)
+                    # Create pose: [pitch, yaw, distance]
+                    delta_pose_mv = torch.tensor([[0.0, yaw_rad, 0.0]], device=self.device)
+                    
+                    # Create conditioning dict for this pose
+                    cond_mv = {
+                        'c_crossattn': [c_text],
+                        'c_concat': [source_img],
+                        'in_concat': [source_latent],
+                        'delta_pose': delta_pose_mv
+                    }
+                    
+                    # Sample using DDIM for faster inference
+                    from ldm.models.diffusion.ddim import DDIMSampler
+                    sampler = DDIMSampler(self)
+                    
+                    shape = [4, source_img.shape[2] // 8, source_img.shape[3] // 8]
+                    
+                    # Use fewer steps for visualization (faster)
+                    samples, _ = sampler.sample(
+                        S=20,  # Quick sampling
+                        batch_size=1,
+                        shape=shape,
+                        conditioning=cond_mv,
+                        verbose=False,
+                        unconditional_guidance_scale=1.0,
+                        eta=0.0
+                    )
+                    
+                    # Decode to image
+                    pred_img = self.decode_first_stage(samples)
+                    pred_img = torch.clamp((pred_img + 1) / 2, 0, 1)
+                    
+                    wandb_images.append(wandb.Image(
+                        pred_img[0],
+                        caption=f"Step {self.global_step} | Yaw: {yaw_deg}°"
+                    ))
+                
+                # Log all multiview predictions
+                run.log({"multiview_predictions": wandb_images})
+                print(f"[VIS] Logged multiview predictions at step {self.global_step}")
 
         self.log("train_loss", loss, prog_bar=True, logger=True)
         return loss
 
     def on_after_backward(self):
-        """Called after loss.backward() - check if LoRA gets gradients"""
-        if self.global_step % 100 == 0:
-            found_lora = False
+        # Print every 50 steps for better visibility
+        if self.global_step % 50 == 0:
+            print(f"\n[GRAD CHECK] Step {self.global_step}")
+            
+            lora_grads = []
+            pose_net_grads = []
+            
             for n, p in self.model.diffusion_model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                    
                 if "lora" in n.lower():
-                    found_lora = True
                     if p.grad is not None:
-                        grad_norm = p.grad.abs().mean().item()
-                        weight_norm = p.abs().mean().item()
-                        print(f"[GRAD] {n}: grad={grad_norm:.6f}, weight={weight_norm:.6f}")
+                        grad_norm = p.grad.norm().item()
+                        grad_mean = p.grad.abs().mean().item()
+                        grad_max = p.grad.abs().max().item()
+                        lora_grads.append((n, grad_norm, grad_mean, grad_max))
                     else:
-                        print(f"[GRAD] {n}: grad=None, weight={p.abs().mean().item():.6f}")
-            if not found_lora:
-                print("[GRAD] No LoRA parameters found in model!")
+                        lora_grads.append((n, None, None, None))
+                        
+                elif "pose_net" in n:
+                    if p.grad is not None:
+                        grad_norm = p.grad.norm().item()
+                        pose_net_grads.append((n, grad_norm))
+                    else:
+                        pose_net_grads.append((n, None))
+            
+            # Print LoRA gradients
+            print(f"  LoRA params ({len(lora_grads)}):")
+            has_nonzero_grad = False
+            for name, norm, mean, max_val in lora_grads:
+                if norm is not None:
+                    if norm > 1e-10:
+                        has_nonzero_grad = True
+                    print(f"    {name.split('.')[-3]}: norm={norm:.2e}, mean={mean:.2e}, max={max_val:.2e}")
+                else:
+                    print(f"    {name.split('.')[-3]}: grad=None!")
+            
+            if not has_nonzero_grad:
+                print("  [WARNING] All LoRA gradients are zero or None!")
+            
+            # Print pose_net gradients  
+            print(f"  pose_net params ({len(pose_net_grads)}):")
+            for name, norm in pose_net_grads:
+                if norm is not None:
+                    print(f"    {name}: norm={norm:.2e}")
+                else:
+                    print(f"    {name}: grad=None!")
 
 
     def configure_optimizers(self):
-        # Explicitly collect LoRA and other trainable params by name
+        # Explicitly collect LoRA and pose_net params separately
         lora_params = []
+        pose_net_params = []
         other_params = []
         
         # Use named_parameters to ensure we get the actual parameter objects
-        param_dict = {}
         for n, p in self.model.diffusion_model.named_parameters():
             if p.requires_grad:
-                param_dict[n] = p
                 if "lora" in n.lower():
                     lora_params.append(p)
-                    print(f"[OPT] LoRA param: {n}, shape={p.shape}, requires_grad={p.requires_grad}")
+                    print(f"[OPT] LoRA param: {n}, shape={p.shape}")
+                elif "pose_net" in n:
+                    pose_net_params.append(p)
+                    print(f"[OPT] pose_net param: {n}, shape={p.shape}")
                 else:
                     other_params.append(p)
+                    print(f"[OPT] Other param: {n}, shape={p.shape}")
         
-        print(f"[OPT] LoRA params: {len(lora_params)}, Other trainable params: {len(other_params)}")
-        print(f"[OPT] Total params in optimizer: {len(lora_params) + len(other_params)}")
+        print(f"\n[OPT] Summary:")
+        print(f"  LoRA params: {len(lora_params)}")
+        print(f"  pose_net params: {len(pose_net_params)}")
+        print(f"  Other trainable params: {len(other_params)}")
+        print(f"  Total params in optimizer: {len(lora_params) + len(pose_net_params) + len(other_params)}")
         
         if len(lora_params) == 0:
             print("[WARNING] No LoRA params found! Check if PEFT is properly configured.")
@@ -308,20 +505,20 @@ class TossLoraModule(TOSS):
                     lora_params.append(p)
                     print(f"[OPT-FALLBACK] Found LoRA param: {n}")
         
-        all_params = lora_params + other_params
-        
-        # Use separate param groups with explicit lr for LoRA
-        optimizer = torch.optim.AdamW([
+        # Use separate param groups with different learning rates
+        # pose_net uses lower LR (0.1x) for gentle fine-tuning
+        param_groups = [
             {"params": lora_params, "lr": self.learning_rate, "name": "lora"},
-            {"params": other_params, "lr": self.learning_rate, "name": "other"}
-        ])
+        ]
+        
+        if len(pose_net_params) > 0:
+            pose_net_lr = self.learning_rate * 0.1  # 10x lower than LoRA
+            param_groups.append({"params": pose_net_params, "lr": pose_net_lr, "name": "pose_net"})
+            print(f"[OPT] pose_net learning rate: {pose_net_lr} (0.1x of LoRA lr: {self.learning_rate})")
+        
+        if len(other_params) > 0:
+            param_groups.append({"params": other_params, "lr": self.learning_rate, "name": "other"})
+        
+        optimizer = torch.optim.AdamW(param_groups)
         
         return optimizer
-
-        # lora_params = [p for n, p in self.named_parameters() if "lora" in n and p.requires_grad]
-        # pose_params = [p for n, p in self.named_parameters() if "pose_net" in n and p.requires_grad]
-
-        # return torch.optim.AdamW([
-        #     {"params": lora_params, "lr": 1e-4}, 
-        #     {"params": pose_params, "lr": 1e-3} # 10x faster learning for 3D parameters
-        # ])

@@ -1,26 +1,62 @@
 model:
-  # target: cldm.toss_lora.TossLoraModule
-  target: cldm.toss.TOSS
+  target: cldm.toss_lora.TossLoraModule
+  # target: cldm.toss.TOSS
   params:
-    # lora_config_params:
-    #     r: 16
-    #     lora_alpha: 16
+    lora_config_params:
+        r: 16
+        lora_alpha: 16
         
-    #     # Use regex pattern to match attention projection layers
-    #     # target_modules: []
-    #     # target_modules: ["attn2.to_q", "attn2.to_k", "attn2.to_v"]
-    #     lora_dropout: 0.0  # Disable dropout for debugging
+        # Use regex pattern to match attention projection layers
+        # target_modules: []
+        # target_modules: ["attn2.to_q", "attn2.to_k", "attn2.to_v"]
+        # lora_dropout: 0.0  # Disable dropout for debugging
 
-    #     target_modules: [
-    #         "middle_block.1.transformer_blocks.0.attn2.to_q",
-    #         "middle_block.1.transformer_blocks.0.attn2.to_k",
-    #         "middle_block.1.transformer_blocks.0.attn2.to_v",
-    #         "output_blocks.3.1.transformer_blocks.0.attn2.to_q",
-    #         "output_blocks.3.1.transformer_blocks.0.attn2.to_k",
-    #         "output_blocks.3.1.transformer_blocks.0.attn2.to_v"
-    #     ]
-    #     # lora_dropout: 0.05
-        # bias: "none"
+        # target_modules: [
+        #     "middle_block.1.transformer_blocks.0.attn2.to_q",
+        #     "middle_block.1.transformer_blocks.0.attn2.to_k",
+        #     "middle_block.1.transformer_blocks.0.attn2.to_v",
+        #     "output_blocks.3.1.transformer_blocks.0.attn2.to_q",
+        #     "output_blocks.3.1.transformer_blocks.0.attn2.to_k",
+        #     "output_blocks.3.1.transformer_blocks.0.attn2.to_v"
+        # ]
+
+        # target_modules: [
+        #       "middle_block.1.transformer_blocks.0.attn2.to_q",
+        #       "middle_block.1.transformer_blocks.0.attn2.to_k",
+        #       "middle_block.1.transformer_blocks.0.attn2.to_v",
+        #       "output_blocks.3.1.transformer_blocks.0.attn2.to_q",
+        #       "output_blocks.3.1.transformer_blocks.0.attn2.to_k",
+        #       "output_blocks.3.1.transformer_blocks.0.attn2.to_v",
+        #       "output_blocks.9.1.transformer_blocks.0.attn1.to_q",
+        #       "output_blocks.9.1.transformer_blocks.0.attn1.to_k",
+        #       "output_blocks.9.1.transformer_blocks.0.attn1.to_v",
+        #       "output_blocks.10.1.transformer_blocks.0.attn1.to_q",
+        #       "output_blocks.10.1.transformer_blocks.0.attn1.to_k",
+        #       "output_blocks.10.1.transformer_blocks.0.attn1.to_v",
+        #       "output_blocks.11.1.transformer_blocks.0.attn1.to_q",
+        #       "output_blocks.11.1.transformer_blocks.0.attn1.to_k",
+        #       "output_blocks.11.1.transformer_blocks.0.attn1.to_v"
+        # ]
+
+        target_modules: [
+            # High-resolution output blocks - important for facial details
+            "output_blocks.9.1.transformer_blocks.0.attn1.to_q",
+            "output_blocks.9.1.transformer_blocks.0.attn1.to_k",
+            "output_blocks.9.1.transformer_blocks.0.attn1.to_v",
+            "output_blocks.10.1.transformer_blocks.0.attn1.to_q",
+            "output_blocks.10.1.transformer_blocks.0.attn1.to_k",
+            "output_blocks.10.1.transformer_blocks.0.attn1.to_v",
+            "output_blocks.11.1.transformer_blocks.0.attn1.to_q",
+            "output_blocks.11.1.transformer_blocks.0.attn1.to_k",
+            "output_blocks.11.1.transformer_blocks.0.attn1.to_v",
+            # Middle block
+            "middle_block.1.transformer_blocks.0.attn1.to_q",
+            "middle_block.1.transformer_blocks.0.attn1.to_k",
+            "middle_block.1.transformer_blocks.0.attn1.to_v"
+        ]
+
+        lora_dropout: 0.05
+        bias: "none"
     linear_start: 0.00085
     linear_end: 0.0120
     num_timesteps_cond: 1
