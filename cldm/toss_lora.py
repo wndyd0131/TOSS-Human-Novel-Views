@@ -4,6 +4,7 @@ from peft import get_peft_model, LoraConfig
 import torch.nn.functional as F
 from torch import nn
 import wandb
+import lpips
 
 # CRITICAL FIX: Completely disable gradient checkpointing to fix LoRA gradient flow
 # The custom CheckpointFunction doesn't properly handle PEFT's dynamically added parameters
@@ -118,7 +119,17 @@ class TossLoraModule(TOSS):
             print(f"[INIT] PEFT config active: {self.model.diffusion_model.peft_config}")
         else:
             print("[WARNING] No peft_config found - PEFT may not be properly initialized!")
+
+        # Initialize perceptual loss (LPIPS)
+        self.lpips_loss = lpips.LPIPS(net='vgg').eval()
+        self.lpips_loss.requires_grad_(False)  # Freeze LPIPS network
+        print("[INIT] Initialized LPIPS perceptual loss (VGG backbone)")
         
+        # Loss weights for hybrid loss
+        self.perceptual_weight = 1.0  # Weight for perceptual loss
+        self.mse_weight = 0.1  # Small MSE component for stability
+        self.mask_min_weight = 0.2  # Soft mask: background contributes 20%, face contributes 100%
+
         # Debug: Check LoRA layer scaling and adapter status
         self._debug_lora_setup()
         self._debug_pose_net_weights()
@@ -270,6 +281,12 @@ class TossLoraModule(TOSS):
                 # Training config from kwargs if available
                 "image_size": self.image_size,
                 "timesteps": self.num_timesteps,
+                # Loss config
+                "loss_type": "perceptual + mse",
+                "perceptual_weight": self.perceptual_weight,
+                "mse_weight": self.mse_weight,
+                "mask_min_weight": self.mask_min_weight,
+                "lpips_backbone": "vgg",
             }, allow_val_change=True)
 
     def training_step(self, batch, batch_idx):
@@ -318,32 +335,86 @@ class TossLoraModule(TOSS):
 
         target = noise
 
-        # MSE
-        loss = (model_output - target) ** 2
-        print("LOSS shape 1:", loss.shape)
-        loss = F.mse_loss(model_output, target, reduction="mean")
-        print("LOSS shape 2:", loss.shape)
+        # # MSE
+        # loss = (model_output - target) ** 2
+        # print("LOSS shape 1:", loss.shape)
+        # loss = F.mse_loss(model_output, target, reduction="mean")
+        # print("LOSS shape 2:", loss.shape)
+        # # if torch.rand(1) < 0.1:
+        # #     cond['in_concat'][0] = torch.zeros_like(cond['in_concat'][0])
+        # # loss, loss_dict = self.forward(x, cond)
 
-        # if torch.rand(1) < 0.1:
-        #     cond['in_concat'][0] = torch.zeros_like(cond['in_concat'][0])
+        # ===== Perceptual Loss Computation =====
+        # Predict x0 from the noise prediction using the diffusion formula:
+        # x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * noise
+        # => x_0 = (x_t - sqrt(1 - alpha_bar_t) * predicted_noise) / sqrt(alpha_bar_t)
+        sqrt_alphas_cumprod = self.sqrt_alphas_cumprod[t][:, None, None, None]
+        sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod[t][:, None, None, None]
+        
+        # Predict x0 from model's noise prediction
+        pred_x0 = (x_noisy - sqrt_one_minus_alphas_cumprod * model_output) / sqrt_alphas_cumprod
+        # Ground truth x0
+        gt_x0 = x  # The clean latent we started with
+        
+        # Decode to image space for perceptual loss
+        # Use torch.no_grad for decoder to save memory (only need gradients through encoder path)
+        pred_img = self.decode_first_stage(pred_x0)  # [-1, 1] range
+        gt_img = self.decode_first_stage(gt_x0)  # [-1, 1] range
+        
+        # Compute perceptual loss (LPIPS expects [-1, 1] range)
+        # Move LPIPS to same device as images
+        self.lpips_loss = self.lpips_loss.to(pred_img.device)
+        perceptual_loss = self.lpips_loss(pred_img, gt_img).mean()
 
-        # loss, loss_dict = self.forward(x, cond)
+        # Optional: small MSE component on noise for training stability
+        mse_loss = F.mse_loss(model_output, target, reduction="mean")
 
+        # Combined loss
+        loss = self.perceptual_weight * perceptual_loss + self.mse_weight * mse_loss
+
+        print(f"LOSS: perceptual={perceptual_loss.item():.4f}, mse={mse_loss.item():.4f}, total={loss.item():.4f}")
 
         mask = batch.get("mask") # Original mask [B, 1, 256, 256]
-        # Latent mask
-        if mask is not None:
-            # latent_mask = F.interpolate(mask, size=loss.shape[-2:], mode="area")
-            latent_mask = F.interpolate(mask, size=model_output.shape[-2:], mode="area")
+        # Latent mask (MSE)
+        # if mask is not None:
+        #     # latent_mask = F.interpolate(mask, size=loss.shape[-2:], mode="area")
+        #     soft_mask = mask * (1.0 - self.mask_min_weight) + self.mask_min_weight  # Range: [min_weight, 1.0]
+        #     latent_mask = F.interpolate(soft_mask, size=model_output.shape[-2:], mode="area")
             
-            # loss = loss * latent_mask
-            # loss = loss.sum() / (latent_mask.sum() + 1e-8)
-            loss = (F.mse_loss(model_output, noise, reduction="none") * latent_mask).sum() / (latent_mask.sum() + 1e-8)
-        else:
-            loss = loss.mean()
+        #     # loss = loss * latent_mask
+        #     # loss = loss.sum() / (latent_mask.sum() + 1e-8)
+        #     loss = (F.mse_loss(model_output, noise, reduction="none") * latent_mask).sum() / (latent_mask.sum() + 1e-8)
+        # else:
+        #     loss = loss.mean()
 
-        run.log({"loss": loss})
-        print("LOSS_SHAPE:", loss.shape)
+        # Latent mask (Perceptual)
+        if mask is not None:
+            # ===== Soft Mask =====
+            # Convert binary mask to soft mask so non-masked regions still contribute
+            # mask=1 (face) -> weight=1.0, mask=0 (background) -> weight=min_weight
+            soft_mask = mask * (1.0 - self.mask_min_weight) + self.mask_min_weight  # Range: [min_weight, 1.0]
+            
+            # For perceptual loss with mask, we need to apply mask in image space
+            img_mask = F.interpolate(soft_mask, size=pred_img.shape[-2:], mode="bilinear", align_corners=False)
+            
+            # Masked perceptual loss: compute per-pixel LPIPS isn't straightforward,
+            # so we use a masked MSE on decoded images as an approximation
+            masked_img_loss = (F.mse_loss(pred_img, gt_img, reduction="none") * img_mask).mean()
+            
+            # Also apply mask to latent MSE
+            latent_mask = F.interpolate(soft_mask, size=model_output.shape[-2:], mode="area")
+            masked_mse_loss = (F.mse_loss(model_output, noise, reduction="none") * latent_mask).mean()
+            
+            # Combine masked losses
+            loss = self.perceptual_weight * masked_img_loss + self.mse_weight * masked_mse_loss
+            print(f"MASKED LOSS: img={masked_img_loss.item():.4f}, mse={masked_mse_loss.item():.4f}")
+
+        run.log({
+            "loss": loss,
+            "perceptual_loss": perceptual_loss,
+            "mse_loss": mse_loss,
+        })
+        print(f"LOSS logged: total={loss.item():.4f}")
 
         if batch_idx % 500 == 0:
             # Generate 4 multiview predictions from a single source image
