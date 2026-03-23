@@ -107,3 +107,66 @@ class DPTDepthModel(DPT):
     def forward(self, x):
         return super().forward(x).squeeze(dim=1)
 
+
+class DPTNormalModel(DPT):
+    """DPT-Hybrid for surface normal estimation. Outputs L2-normalized [3, H, W] per pixel."""
+
+    def __init__(self, path=None, **kwargs):
+        features = kwargs.get("features", 256)
+
+        head = nn.Sequential(
+            nn.Conv2d(features, features // 2, kernel_size=3, stride=1, padding=1),
+            Interpolate(scale_factor=2, mode="bilinear", align_corners=True),
+            nn.Conv2d(features // 2, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(True),
+            nn.Conv2d(32, 3, kernel_size=1, stride=1, padding=0),
+        )
+
+        super().__init__(head, **kwargs)
+
+        if path is not None:
+            self._load_weights(path)
+
+    def _load_weights(self, path):
+        """Load weights from Omnidata checkpoint (supports HF repo, Lightning ckpt, raw state_dict)."""
+        if path.startswith("hf:") or path.startswith("hf://"):
+            from huggingface_hub import hf_hub_download, list_repo_files
+            repo_id = path.split(":", 1)[-1].replace("//", "").strip()
+            candidates = [
+                "omnidata_dpt_normal_v2.ckpt",
+                "omnidata_normal_dpt_hybrid.pth",
+                "pytorch_model.bin",
+            ]
+            try:
+                files = list_repo_files(repo_id)
+                for c in candidates:
+                    if c in files:
+                        path = hf_hub_download(repo_id=repo_id, filename=c)
+                        break
+                else:
+                    path = hf_hub_download(repo_id=repo_id, filename=candidates[0])
+            except Exception:
+                path = hf_hub_download(repo_id=repo_id, filename=candidates[0])
+
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        state = ckpt
+        if isinstance(ckpt, dict):
+            if "state_dict" in ckpt:
+                state = ckpt["state_dict"]
+            elif "model" in ckpt:
+                state = ckpt["model"]
+        # Handle Lightning prefix "model."
+        if state and any(k.startswith("model.") for k in state.keys()):
+            state = {k.replace("model.", ""): v for k, v in state.items()}
+        missing, unexpected = self.load_state_dict(state, strict=False)
+        if missing:
+            print(f"[DPTNormal] Missing keys: {len(missing)}")
+        if unexpected:
+            print(f"[DPTNormal] Unexpected keys: {len(unexpected)}")
+
+    def forward(self, x):
+        out = super().forward(x)  # [B, 3, H, W]
+        # L2 normalize per pixel for cosine similarity
+        norm = out.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        return out / norm
+

@@ -17,9 +17,23 @@ ldm_util.checkpoint = _no_checkpoint
 print("[PATCH] Disabled gradient checkpointing in ldm_util.checkpoint")
 
 run = None
+
+def _cosine_similarity_loss(pred_normals, gt_normals, mask, eps=1e-8):
+    """Masked cosine similarity loss. pred, gt: [B,3,H,W] L2-normalized. mask: [B,1,H,W]."""
+    cos_sim = (pred_normals * gt_normals).sum(dim=1, keepdim=True).clamp(-1, 1)
+    loss = 1 - cos_sim  # [B,1,H,W]
+    if mask is not None:
+        loss = loss * mask
+        return loss.sum() / (mask.sum() + eps)
+    return loss.mean()
+
 class TossLoraModule(TOSS):
-    def __init__(self, lora_config_params, *args, **kwargs):
+    def __init__(self, lora_config_params, *args, normal_estimator_path="hf:clay3d/omnidata", geometry_loss_weight=0.1, **kwargs):
+        kwargs.pop("lora_config_params", None)  # consumed by us
+        self.normal_estimator_path = kwargs.pop("normal_estimator_path", normal_estimator_path)
+        self.geometry_loss_weight = kwargs.pop("geometry_loss_weight", geometry_loss_weight)
         super().__init__(*args, **kwargs)
+        self._normal_estimator = None
 
         global run
         run = wandb.init(
@@ -36,11 +50,6 @@ class TossLoraModule(TOSS):
                 "base_model": "Stable Diffusion UNet"
             },
         )
-
-        # internal_unet = self.model.diffusion_model
-
-        # # Turn off checkpointing manually
-        # internal_unet.use_checkpoint = False
 
         # Change pose_net in_feature channel from 51 to 16
         # self.model.diffusion_model.pose_net = nn.Sequential(
@@ -76,7 +85,7 @@ class TossLoraModule(TOSS):
                 print(f"[WARNING] Checkpointing still enabled on: {name}")
         print(f"[INIT] Modules with checkpointing enabled: {ckpt_enabled_count}")
 
-        # 3. PoseNet
+        # 3. Unfreeze PoseNet params
         pose_net_count = 0
         for n, p in self.model.diffusion_model.named_parameters():
             if "pose_net" in n:
@@ -178,6 +187,14 @@ class TossLoraModule(TOSS):
         if hasattr(pose_net, '2') and hasattr(pose_net[2], 'out_features'):
             print(f"  Output features (pose_net[2].out_features): {pose_net[2].out_features}")
 
+    @property
+    def normal_estimator(self):
+        """Lazy-load frozen DPT-Hybrid normal estimator."""
+        if self._normal_estimator is None:
+            from ldm.modules.midas.api import DPTNormalInference
+            self._normal_estimator = DPTNormalInference(self.normal_estimator_path).to(self.device)
+            print(f"[INIT] Loaded DPT-Hybrid normal estimator from {self.normal_estimator_path}")
+        return self._normal_estimator
 
     def _register_lora_debug_hook(self):
         """Register hooks to debug LoRA forward pass"""
@@ -330,12 +347,12 @@ class TossLoraModule(TOSS):
 
         x_noisy = self.q_sample(x_start=x, t=t, noise=noise)
 
-        # Note: x_noisy doesn't need requires_grad - we only need gradients for model params
+        '''Forward'''
         model_output = self.apply_model(x_noisy, t, cond)
 
         target = noise
 
-        # # MSE
+        '''MSE Loss'''
         # loss = (model_output - target) ** 2
         # print("LOSS shape 1:", loss.shape)
         # loss = F.mse_loss(model_output, target, reduction="mean")
@@ -344,7 +361,7 @@ class TossLoraModule(TOSS):
         # #     cond['in_concat'][0] = torch.zeros_like(cond['in_concat'][0])
         # # loss, loss_dict = self.forward(x, cond)
 
-        # ===== Perceptual Loss Computation =====
+        '''Perceptual Loss Computation'''
         # Predict x0 from the noise prediction using the diffusion formula:
         # x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * noise
         # => x_0 = (x_t - sqrt(1 - alpha_bar_t) * predicted_noise) / sqrt(alpha_bar_t)
@@ -369,13 +386,14 @@ class TossLoraModule(TOSS):
         # Optional: small MSE component on noise for training stability
         mse_loss = F.mse_loss(model_output, target, reduction="mean")
 
-        # Combined loss
+        '''Combine Loss'''
         loss = self.perceptual_weight * perceptual_loss + self.mse_weight * mse_loss
-
         print(f"LOSS: perceptual={perceptual_loss.item():.4f}, mse={mse_loss.item():.4f}, total={loss.item():.4f}")
 
-        mask = batch.get("mask") # Original mask [B, 1, 256, 256]
-        # Latent mask (MSE)
+
+        mask = batch.get("mask") # Original mask [B, 1, 256, 256]        
+
+        '''Latent mask (MSE)'''
         # if mask is not None:
         #     # latent_mask = F.interpolate(mask, size=loss.shape[-2:], mode="area")
         #     soft_mask = mask * (1.0 - self.mask_min_weight) + self.mask_min_weight  # Range: [min_weight, 1.0]
@@ -387,7 +405,7 @@ class TossLoraModule(TOSS):
         # else:
         #     loss = loss.mean()
 
-        # Latent mask (Perceptual)
+        '''Latent mask (Perceptual)'''
         if mask is not None:
             # ===== Soft Mask =====
             # Convert binary mask to soft mask so non-masked regions still contribute
@@ -409,13 +427,28 @@ class TossLoraModule(TOSS):
             loss = self.perceptual_weight * masked_img_loss + self.mse_weight * masked_mse_loss
             print(f"MASKED LOSS: img={masked_img_loss.item():.4f}, mse={masked_mse_loss.item():.4f}")
 
+        ''' Geometry loss (frozen DPT-Hybrid proxy) '''
+        if self.geometry_loss_weight > 0 and "normal" in batch and "normal_mask" in batch:
+            x0_pred = x - model_output
+            pred_imgs = self.decode_first_stage(x0_pred)
+            pred_imgs = torch.clamp((pred_imgs + 1) / 2, 0, 1)
+            if pred_imgs.ndim == 4 and pred_imgs.shape[-1] == 3:
+                pred_imgs = pred_imgs.permute(0, 3, 1, 2)
+            pred_normals = self.normal_estimator(pred_imgs)
+            gt_normals = batch["normal"].to(self.device)
+            normal_mask = batch["normal_mask"].to(self.device)
+            geom_loss = _cosine_similarity_loss(pred_normals, gt_normals, normal_mask)
+            loss = loss + self.geometry_loss_weight * geom_loss
+
         run.log({
             "loss": loss,
             "perceptual_loss": perceptual_loss,
             "mse_loss": mse_loss,
+            "geometry_loss": geom_loss
         })
         print(f"LOSS logged: total={loss.item():.4f}")
 
+        '''WanDB logging'''
         if batch_idx % 500 == 0:
             # Generate 4 multiview predictions from a single source image
             with torch.no_grad():
