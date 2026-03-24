@@ -27,6 +27,15 @@ def _cosine_similarity_loss(pred_normals, gt_normals, mask, eps=1e-8):
         return loss.sum() / (mask.sum() + eps)
     return loss.mean()
 
+def _masked_l2_depth_loss(pred, gt, mask=None, eps=1e-8):
+    """Masked L2 (MSE) depth loss. pred, gt: [B,1,H,W]. mask: [B,1,H,W] optional."""
+    loss = (pred - gt) ** 2
+    loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
+    if mask is not None:
+        loss = loss * mask
+        return loss.sum() / (mask.sum() + eps)
+    return loss.mean()
+
 def _masked_l1_depth_loss(pred, gt, mask=None, eps=1e-8):
     """Masked L1 depth loss. pred, gt: [B,1,H,W]. mask: [B,1,H,W] optional.
 
@@ -568,7 +577,7 @@ class TossLoraModule(TOSS):
                 valid_px = depth_mask.sum().item() if depth_mask is not None else "N/A"
                 print(f"[DEPTH DBG] pred range=[{depth_pred_up.min():.3f}, {depth_pred_up.max():.3f}]  "
                       f"gt range=[{gt_depth.min():.3f}, {gt_depth.max():.3f}]  valid_px={valid_px}")
-            depth_loss = _masked_l1_depth_loss(depth_pred_up, gt_depth, depth_mask)
+            depth_loss = _masked_l2_depth_loss(depth_pred_up, gt_depth, depth_mask)
             loss = loss + self.depth_loss_weight * depth_loss
             print(f"DEPTH LOSS: {depth_loss.item():.4f}")
 
@@ -582,7 +591,7 @@ class TossLoraModule(TOSS):
         print(f"LOSS logged: total={loss.item():.4f}")
 
         '''WanDB logging'''
-        if batch_idx % 500 == 0:
+        if batch_idx % 100 == 0:
             # Generate 4 multiview predictions from a single source image
             with torch.no_grad():
                 import math
