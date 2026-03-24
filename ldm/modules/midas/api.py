@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from torchvision.transforms import Compose
 
-from ldm.modules.midas.midas.dpt_depth import DPTDepthModel
+from ldm.modules.midas.midas.dpt_depth import DPTDepthModel, DPTNormalModel
 from ldm.modules.midas.midas.midas_net import MidasNet
 from ldm.modules.midas.midas.midas_net_custom import MidasNet_small
 from ldm.modules.midas.midas.transforms import Resize, NormalizeImage, PrepareForNet
@@ -132,6 +132,58 @@ def load_model(model_type):
     )
 
     return model.eval(), transform
+
+
+def load_dpt_normal_model(model_path="hf:clay3d/omnidata"):
+    """
+    Load frozen DPT-Hybrid normal estimator.
+    model_path: local path, or "hf:repo_id" to download from HuggingFace (e.g. "hf:clay3d/omnidata")
+    """
+    model = DPTNormalModel(
+        path=model_path,
+        backbone="vitb_rn50_384",
+        features=256,
+    )
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+    return model
+
+
+class DPTNormalInference(nn.Module):
+    """Frozen DPT-Hybrid normal estimator. Input: RGB [0,1] [B,3,H,W]. Output: normals [B,3,H,W] L2-normalized."""
+
+    def __init__(self, model_path="hf:clay3d/omnidata"):
+        super().__init__()
+        self.model = load_dpt_normal_model(model_path)
+        self.model.train = disabled_train
+        self.net_w = self.net_h = 384
+        self.normalization = NormalizeImage(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+
+    def preprocess(self, rgb):
+        """rgb: [B,3,H,W] in [0,1]. Returns tensor ready for DPT (384x384, normalized)."""
+        x = self.normalization(rgb)
+        x = torch.nn.functional.interpolate(
+            x, size=(self.net_h, self.net_w), mode="bilinear", align_corners=False
+        )
+        return x
+
+    def forward(self, rgb):
+        """rgb: [B,3,H,W] in [0,1]. Returns normals [B,3,H,W] L2-normalized, resized to input size.
+        Gradients flow through rgb for geometry loss; model params are frozen."""
+        x = self.preprocess(rgb)
+        out = self.model(x)
+        out = torch.nn.functional.interpolate(
+            out, size=rgb.shape[2:], mode="bilinear", align_corners=False
+        )
+        norm = out.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        out = out / norm
+        return out
+
+    def forward_features(self, rgb):
+        """Extract geometry features for perceptual loss. Returns [B, 256, H', W'] at DPT resolution."""
+        x = self.preprocess(rgb)
+        return self.model.forward_features(x)
 
 
 class MiDaSInference(nn.Module):

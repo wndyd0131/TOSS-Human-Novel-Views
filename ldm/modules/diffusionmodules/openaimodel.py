@@ -257,7 +257,7 @@ class ResBlock(TimestepBlock):
 
 
     def _forward(self, x, emb):
-        print("X:", x.shape)
+        # print("X:", x.shape)
         if self.updown:
             in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
             h = in_rest(x)
@@ -275,7 +275,7 @@ class ResBlock(TimestepBlock):
             h = out_norm(h) * (1 + scale) + shift
             h = out_rest(h)
         else:
-            print("H:", h.shape, " EMB:", emb.shape)
+            # print("H:", h.shape, " EMB:", emb.shape)
             h = h + emb_out
             h = self.out_layers(h)
         return self.skip_connection(x) + h
@@ -869,6 +869,21 @@ def get_position_embedder(multires, i=0, in_dim=3, include_input=True):
     return embed, out_dim
 
 
+class DepthHead(nn.Module):
+    def __init__(self, in_channels, hidden_channels=128):
+        super().__init__()
+        self.layers = nn.Sequential(
+            normalization(in_channels),
+            nn.SiLU(),
+            nn.Conv2d(in_channels, hidden_channels, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden_channels, 1, 1),
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+
 class UNetModel_toss(nn.Module):
     """
     The full UNet model with attention and timestep embedding.
@@ -928,7 +943,8 @@ class UNetModel_toss(nn.Module):
         disable_self_attentions=None,
         num_attention_blocks=None,
         temp_attn="CA",
-        pos_enc_dim=8, dir_enc_dim=8,pose_enc="freq"
+        pos_enc_dim=8, dir_enc_dim=8,pose_enc="freq",
+        use_depth_head=False,
     ):
         super().__init__()
         if use_spatial_transformer:
@@ -1045,7 +1061,9 @@ class UNetModel_toss(nn.Module):
                                 use_new_attention_order=use_new_attention_order,
                             ) if not use_spatial_transformer else SpatialTransformer_gate(
                                 ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim,
-                                disable_self_attn=disabled_sa, temp_attn=temp_attn, enable_gate_attn=False
+                                # disable_self_attn=disabled_sa, temp_attn=temp_attn, enable_gate_attn=False
+                                disable_self_attn=disabled_sa, temp_attn=temp_attn, enable_gate_attn=False,
+                                use_checkpoint=use_checkpoint
                             )
                         )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -1100,8 +1118,11 @@ class UNetModel_toss(nn.Module):
                 num_head_channels=dim_head,
                 use_new_attention_order=use_new_attention_order,
             ) if not use_spatial_transformer else SpatialTransformer_gate(  # always uses a self-attn
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim, \
-                                temp_attn=temp_attn, enable_gate_attn=False
+                            # ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim, \
+                            #     temp_attn=temp_attn, enable_gate_attn=False
+                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim,
+                            temp_attn=temp_attn, enable_gate_attn=False,
+                            use_checkpoint=use_checkpoint
                         ),
             ResBlock(
                 ch,
@@ -1153,8 +1174,11 @@ class UNetModel_toss(nn.Module):
                                 num_head_channels=dim_head,
                                 use_new_attention_order=use_new_attention_order,
                             ) if not use_spatial_transformer else SpatialTransformer_gate(
+                                # ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim,
+                                # disable_self_attn=disabled_sa, temp_attn=temp_attn, enable_gate_attn=False
                                 ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim,
-                                disable_self_attn=disabled_sa, temp_attn=temp_attn, enable_gate_attn=False
+                                temp_attn=temp_attn, enable_gate_attn=False,
+                                use_checkpoint=use_checkpoint
                             )
                         )
                 if level and i == self.num_res_blocks[level]:
@@ -1229,6 +1253,8 @@ class UNetModel_toss(nn.Module):
                 linear(model_channels, model_channels),
             )
 
+        self.depth_head = DepthHead(model_channels) if use_depth_head else None
+
     def convert_to_fp16(self):
         """
         Convert the torso of the model to float16.
@@ -1289,9 +1315,15 @@ class UNetModel_toss(nn.Module):
             h = th.cat([h, hs.pop()], dim=1)
             h = module(h, emb, context, pos_emb)
         h = h.type(x.dtype)
+        B_orig = x.shape[0] // 2
+        aux = {}
+        if self.depth_head is not None:
+            aux["depth"] = self.depth_head(h[:B_orig])  # [B, 1, H, W]
+        # Future heads: aux["normal"] = self.normal_head(h[:B_orig]), etc.
+
         if self.predict_codebook_ids:
-            return self.id_predictor(h)[:x.shape[0]//2] if "CA" in self.temp_attn else self.id_predictor(h)
-            # return self.id_predictor(h)
+            noise_out = self.id_predictor(h)[:x.shape[0]//2] if "CA" in self.temp_attn else self.id_predictor(h)
         else:
-            return self.out(h)[:x.shape[0]//2] if "CA" in self.temp_attn else self.out(h)
-            # return self.out(h)
+            noise_out = self.out(h)[:x.shape[0]//2] if "CA" in self.temp_attn else self.out(h)
+
+        return (noise_out, aux) if aux else noise_out
