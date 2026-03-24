@@ -27,11 +27,20 @@ def _cosine_similarity_loss(pred_normals, gt_normals, mask, eps=1e-8):
         return loss.sum() / (mask.sum() + eps)
     return loss.mean()
 
+def _masked_l1_depth_loss(pred, gt, mask=None, eps=1e-8):
+    """Masked L1 depth loss. pred, gt: [B,1,H,W]. mask: [B,1,H,W] optional."""
+    loss = torch.abs(pred - gt)
+    if mask is not None:
+        loss = loss * mask
+        return loss.sum() / (mask.sum() + eps)
+    return loss.mean()
+
 class TossLoraModule(TOSS):
-    def __init__(self, lora_config_params, *args, normal_estimator_path="hf:clay3d/omnidata", geometry_loss_weight=0.1, **kwargs):
+    def __init__(self, lora_config_params, *args, normal_estimator_path="hf:clay3d/omnidata", geometry_loss_weight=0.1, depth_loss_weight=0.0, **kwargs):
         kwargs.pop("lora_config_params", None)  # consumed by us
         self.normal_estimator_path = kwargs.pop("normal_estimator_path", normal_estimator_path)
         self.geometry_loss_weight = kwargs.pop("geometry_loss_weight", geometry_loss_weight)
+        self.depth_loss_weight = kwargs.pop("depth_loss_weight", depth_loss_weight)
         super().__init__(*args, **kwargs)
         self._normal_estimator = None
 
@@ -93,6 +102,15 @@ class TossLoraModule(TOSS):
                 pose_net_count += 1
                 print(f"[INIT] Unfreezing pose_net param: {n}, shape={p.shape}")
         print(f"[INIT] Unfroze {pose_net_count} pose_net parameters")
+
+        # 3b. Unfreeze DepthHead params (if present)
+        depth_head_count = 0
+        for n, p in self.model.diffusion_model.named_parameters():
+            if "depth_head" in n:
+                p.requires_grad = True
+                depth_head_count += 1
+                print(f"[INIT] Unfreezing depth_head param: {n}, shape={p.shape}")
+        print(f"[INIT] Unfroze {depth_head_count} depth_head parameters")
         
         # 4. Explicitly enable gradients for LoRA parameters (in case PEFT didn't)
         lora_count = 0
@@ -418,7 +436,12 @@ class TossLoraModule(TOSS):
         x_noisy = self.q_sample(x_start=x, t=t, noise=noise)
 
         '''Forward'''
-        model_output = self.apply_model(x_noisy, t, cond)
+        raw_output = self.apply_model(x_noisy, t, cond)
+        if isinstance(raw_output, tuple):
+            model_output, aux = raw_output
+            depth_pred = aux.get("depth")
+        else:
+            model_output, depth_pred = raw_output, None
 
         target = noise
 
@@ -498,6 +521,7 @@ class TossLoraModule(TOSS):
             print(f"MASKED LOSS: img={masked_img_loss.item():.4f}, mse={masked_mse_loss.item():.4f}")
 
         ''' Geometry loss (frozen DPT-Hybrid proxy) '''
+        geom_loss = torch.tensor(0.0, device=self.device)
         if self.geometry_loss_weight > 0 and "normal" in batch and "normal_mask" in batch:
             x0_pred = x - model_output
             pred_imgs = self.decode_first_stage(x0_pred)
@@ -510,11 +534,24 @@ class TossLoraModule(TOSS):
             geom_loss = _cosine_similarity_loss(pred_normals, gt_normals, normal_mask)
             loss = loss + self.geometry_loss_weight * geom_loss
 
+        ''' Depth loss '''
+        depth_loss = torch.tensor(0.0, device=self.device)
+        if depth_pred is not None and self.depth_loss_weight > 0 and "depth" in batch:
+            gt_depth = batch["depth"].to(self.device)
+            if gt_depth.ndim == 3:
+                gt_depth = gt_depth.unsqueeze(1) # to [B, 1, H, W]
+            depth_pred_up = F.interpolate(depth_pred, size=gt_depth.shape[-2:], mode="bilinear", align_corners=False) # latent resolution (32x32) to gt resolution (256x256)
+            depth_mask = batch["depth_mask"].to(self.device) if "depth_mask" in batch else None
+            depth_loss = _masked_l1_depth_loss(depth_pred_up, gt_depth, depth_mask)
+            loss = loss + self.depth_loss_weight * depth_loss
+            print(f"DEPTH LOSS: {depth_loss.item():.4f}")
+
         run.log({
             "loss": loss,
             "perceptual_loss": perceptual_loss,
             "mse_loss": mse_loss,
-            "geometry_loss": geom_loss
+            "geometry_loss": geom_loss,
+            "depth_loss": depth_loss,
         })
         print(f"LOSS logged: total={loss.item():.4f}")
 
@@ -647,9 +684,10 @@ class TossLoraModule(TOSS):
 
 
     def configure_optimizers(self):
-        # Explicitly collect LoRA and pose_net params separately
+        # Explicitly collect LoRA, pose_net, and depth_head params separately
         lora_params = []
         pose_net_params = []
+        depth_head_params = []
         other_params = []
         
         # Use named_parameters to ensure we get the actual parameter objects
@@ -661,6 +699,9 @@ class TossLoraModule(TOSS):
                 elif "pose_net" in n:
                     pose_net_params.append(p)
                     print(f"[OPT] pose_net param: {n}, shape={p.shape}")
+                elif "depth_head" in n:
+                    depth_head_params.append(p)
+                    print(f"[OPT] depth_head param: {n}, shape={p.shape}")
                 else:
                     other_params.append(p)
                     print(f"[OPT] Other param: {n}, shape={p.shape}")
@@ -668,8 +709,9 @@ class TossLoraModule(TOSS):
         print(f"\n[OPT] Summary:")
         print(f"  LoRA params: {len(lora_params)}")
         print(f"  pose_net params: {len(pose_net_params)}")
+        print(f"  depth_head params: {len(depth_head_params)}")
         print(f"  Other trainable params: {len(other_params)}")
-        print(f"  Total params in optimizer: {len(lora_params) + len(pose_net_params) + len(other_params)}")
+        print(f"  Total params in optimizer: {len(lora_params) + len(pose_net_params) + len(depth_head_params) + len(other_params)}")
         
         if len(lora_params) == 0:
             print("[WARNING] No LoRA params found! Check if PEFT is properly configured.")
@@ -684,12 +726,24 @@ class TossLoraModule(TOSS):
         param_groups = [
             {"params": lora_params, "lr": self.learning_rate, "name": "lora"},
         ]
+        ''' Example of param groups
+        param_groups = [
+            {"params": lora_params,       "lr": self.learning_rate},        # e.g. 1e-4
+            {"params": pose_net_params,   "lr": self.learning_rate * 0.1},  # 1e-5 — gentle fine-tune
+            {"params": depth_head_params, "lr": self.learning_rate},        # 1e-4 — trained from scratch
+            {"params": other_params,      "lr": self.learning_rate},
+        ]
+        '''
         
         if len(pose_net_params) > 0:
             pose_net_lr = self.learning_rate * 0.1  # 10x lower than LoRA
             param_groups.append({"params": pose_net_params, "lr": pose_net_lr, "name": "pose_net"})
             print(f"[OPT] pose_net learning rate: {pose_net_lr} (0.1x of LoRA lr: {self.learning_rate})")
-        
+
+        if len(depth_head_params) > 0:
+            param_groups.append({"params": depth_head_params, "lr": self.learning_rate, "name": "depth_head"})
+            print(f"[OPT] depth_head learning rate: {self.learning_rate}")
+
         if len(other_params) > 0:
             param_groups.append({"params": other_params, "lr": self.learning_rate, "name": "other"})
         

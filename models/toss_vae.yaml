@@ -40,7 +40,7 @@ model:
     conditioning_key: crossattn
     monitor: val/loss_simple_ema
     scale_factor: 0.18215
-    use_ema: True
+    use_ema: False
     only_mid_control: False
     ucg_txt: 0.5
     max_timesteps: 1000
@@ -51,6 +51,9 @@ model:
     # Geometry loss (frozen DPT-Hybrid normal estimator)
     normal_estimator_path: "hf:clay3d/omnidata"
     geometry_loss_weight: 0.1
+
+    # Depth head loss
+    depth_loss_weight: 0.1
 
     scheduler_config: # 10000 warmup steps
       target: ldm.lr_scheduler.LambdaLinearScheduler
@@ -81,6 +84,7 @@ model:
         pose_enc: "vae"
         # pose_enc: "freq"
         # pose_enc: "identity"
+        use_depth_head: True
 
     first_stage_config:
       target: ldm.models.autoencoder.AutoencoderKL
