@@ -28,8 +28,13 @@ def _cosine_similarity_loss(pred_normals, gt_normals, mask, eps=1e-8):
     return loss.mean()
 
 def _masked_l1_depth_loss(pred, gt, mask=None, eps=1e-8):
-    """Masked L1 depth loss. pred, gt: [B,1,H,W]. mask: [B,1,H,W] optional."""
+    """Masked L1 depth loss. pred, gt: [B,1,H,W]. mask: [B,1,H,W] optional.
+
+    NaN guard: NaN*0=NaN in IEEE 754, so we zero-out NaN elements in the
+    per-pixel loss before masking, rather than relying on the mask alone.
+    """
     loss = torch.abs(pred - gt)
+    loss = torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0)
     if mask is not None:
         loss = loss * mask
         return loss.sum() / (mask.sum() + eps)
@@ -375,6 +380,18 @@ class TossLoraModule(TOSS):
                 "lpips_backbone": "vgg",
             }, allow_val_change=True)
 
+    def apply_model(self, x_noisy, t, cond, *args, **kwargs):
+        """Override to always return a plain noise tensor.
+
+        The UNet may return (noise, aux_dict) when depth_head is active.
+        Callers like DDIM expect a plain tensor, so we strip aux here.
+        Use the diffusion model directly in training_step to access aux outputs.
+        """
+        raw = super().apply_model(x_noisy, t, cond, *args, **kwargs)
+        if isinstance(raw, tuple):
+            return raw[0]
+        return raw
+
     def training_step(self, batch, batch_idx):
 
         # Ensure model is in training mode
@@ -435,11 +452,14 @@ class TossLoraModule(TOSS):
 
         x_noisy = self.q_sample(x_start=x, t=t, noise=noise)
 
-        '''Forward'''
-        raw_output = self.apply_model(x_noisy, t, cond)
+        '''Forward — call diffusion model directly to capture aux outputs'''
+        cond_txt = torch.cat(cond['c_crossattn'], 1)
+        raw_output = self.model.diffusion_model(
+            x=torch.cat([x_noisy] + cond['in_concat'], dim=0),
+            timesteps=t, context=cond_txt, delta_pose=cond['delta_pose'])
         if isinstance(raw_output, tuple):
             model_output, aux = raw_output
-            depth_pred = aux.get("depth")
+            depth_pred = aux.get("depth") if isinstance(aux, dict) else aux
         else:
             model_output, depth_pred = raw_output, None
 
@@ -539,9 +559,15 @@ class TossLoraModule(TOSS):
         if depth_pred is not None and self.depth_loss_weight > 0 and "depth" in batch:
             gt_depth = batch["depth"].to(self.device)
             if gt_depth.ndim == 3:
-                gt_depth = gt_depth.unsqueeze(1) # to [B, 1, H, W]
-            depth_pred_up = F.interpolate(depth_pred, size=gt_depth.shape[-2:], mode="bilinear", align_corners=False) # latent resolution (32x32) to gt resolution (256x256)
+                gt_depth = gt_depth.unsqueeze(1)  # [B, 1, H, W]
+            # Guard: DepthHead runs GroupNorm on fresh weights; clamp any ±inf/NaN
+            depth_pred = torch.nan_to_num(depth_pred, nan=0.0, posinf=0.0, neginf=0.0)
+            depth_pred_up = F.interpolate(depth_pred, size=gt_depth.shape[-2:], mode="bilinear", align_corners=False)
             depth_mask = batch["depth_mask"].to(self.device) if "depth_mask" in batch else None
+            if batch_idx < 5:
+                valid_px = depth_mask.sum().item() if depth_mask is not None else "N/A"
+                print(f"[DEPTH DBG] pred range=[{depth_pred_up.min():.3f}, {depth_pred_up.max():.3f}]  "
+                      f"gt range=[{gt_depth.min():.3f}, {gt_depth.max():.3f}]  valid_px={valid_px}")
             depth_loss = _masked_l1_depth_loss(depth_pred_up, gt_depth, depth_mask)
             loss = loss + self.depth_loss_weight * depth_loss
             print(f"DEPTH LOSS: {depth_loss.item():.4f}")
