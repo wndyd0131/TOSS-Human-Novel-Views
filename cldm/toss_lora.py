@@ -49,12 +49,30 @@ def _masked_l1_depth_loss(pred, gt, mask=None, eps=1e-8):
         return loss.sum() / (mask.sum() + eps)
     return loss.mean()
 
+def _masked_gradient_depth_loss(pred, gt, mask=None, eps=1e-8):
+    """Masked gradient (finite-difference) depth loss."""
+    pred_dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+    pred_dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+    gt_dx   = gt[:, :, :, 1:]   - gt[:, :, :, :-1]
+    gt_dy   = gt[:, :, 1:, :]   - gt[:, :, :-1, :]
+
+    loss_dx = torch.nan_to_num(torch.abs(pred_dx - gt_dx), nan=0.0, posinf=0.0, neginf=0.0)
+    loss_dy = torch.nan_to_num(torch.abs(pred_dy - gt_dy), nan=0.0, posinf=0.0, neginf=0.0)
+
+    if mask is not None:
+        mask_dx = mask[:, :, :, 1:] * mask[:, :, :, :-1]
+        mask_dy = mask[:, :, 1:, :] * mask[:, :, :-1, :]
+        return (loss_dx * mask_dx).sum() / (mask_dx.sum() + eps) \
+             + (loss_dy * mask_dy).sum() / (mask_dy.sum() + eps)
+    return loss_dx.mean() + loss_dy.mean()
+
 class TossLoraModule(TOSS):
-    def __init__(self, lora_config_params, *args, normal_estimator_path="hf:clay3d/omnidata", geometry_loss_weight=0.1, depth_loss_weight=0.0, **kwargs):
+    def __init__(self, lora_config_params, *args, normal_estimator_path="hf:clay3d/omnidata", geometry_loss_weight=0.1, depth_loss_weight=0.0, depth_grad_weight=0.0, **kwargs):
         kwargs.pop("lora_config_params", None)  # consumed by us
         self.normal_estimator_path = kwargs.pop("normal_estimator_path", normal_estimator_path)
         self.geometry_loss_weight = kwargs.pop("geometry_loss_weight", geometry_loss_weight)
         self.depth_loss_weight = kwargs.pop("depth_loss_weight", depth_loss_weight)
+        self.depth_grad_weight = kwargs.pop("depth_grad_weight", depth_grad_weight)
         super().__init__(*args, **kwargs)
         self._normal_estimator = None
 
@@ -549,6 +567,11 @@ class TossLoraModule(TOSS):
             loss = self.perceptual_weight * masked_img_loss + self.mse_weight * masked_mse_loss
             print(f"MASKED LOSS: img={masked_img_loss.item():.4f}, mse={masked_mse_loss.item():.4f}")
 
+        pred_normals_vis = None
+        gt_normals_vis = None
+        depth_pred_vis = None
+        gt_depth_vis = None
+
         ''' Geometry loss (frozen DPT-Hybrid proxy) '''
         geom_loss = torch.tensor(0.0, device=self.device)
         if self.geometry_loss_weight > 0 and "normal" in batch and "normal_mask" in batch:
@@ -560,11 +583,15 @@ class TossLoraModule(TOSS):
             pred_normals = self.normal_estimator(pred_imgs)
             gt_normals = batch["normal"].to(self.device)
             normal_mask = batch["normal_mask"].to(self.device)
+            pred_normals_vis = pred_normals.detach()
+            gt_normals_vis = gt_normals.detach()
             geom_loss = _cosine_similarity_loss(pred_normals, gt_normals, normal_mask)
             loss = loss + self.geometry_loss_weight * geom_loss
 
         ''' Depth loss '''
         depth_loss = torch.tensor(0.0, device=self.device)
+        depth_loss_l1   = torch.tensor(0.0, device=self.device)
+        depth_loss_grad = torch.tensor(0.0, device=self.device)
         if depth_pred is not None and self.depth_loss_weight > 0 and "depth" in batch:
             gt_depth = batch["depth"].to(self.device)
             if gt_depth.ndim == 3:
@@ -577,9 +604,14 @@ class TossLoraModule(TOSS):
                 valid_px = depth_mask.sum().item() if depth_mask is not None else "N/A"
                 print(f"[DEPTH DBG] pred range=[{depth_pred_up.min():.3f}, {depth_pred_up.max():.3f}]  "
                       f"gt range=[{gt_depth.min():.3f}, {gt_depth.max():.3f}]  valid_px={valid_px}")
-            depth_loss = _masked_l2_depth_loss(depth_pred_up, gt_depth, depth_mask)
-            loss = loss + self.depth_loss_weight * depth_loss
-            print(f"DEPTH LOSS: {depth_loss.item():.4f}")
+            depth_pred_vis = depth_pred_up.detach()
+            gt_depth_vis = gt_depth.detach()
+            depth_loss_l1   = _masked_l1_depth_loss(depth_pred_up, gt_depth, depth_mask)
+            depth_loss_grad = _masked_gradient_depth_loss(depth_pred_up, gt_depth, depth_mask)
+            depth_loss = (self.depth_loss_weight  * depth_loss_l1
+                        + self.depth_grad_weight  * depth_loss_grad)
+            loss = loss + depth_loss
+            print(f"DEPTH LOSS: l1={depth_loss_l1.item():.4f} grad={depth_loss_grad.item():.4f} total={depth_loss.item():.4f}")
 
         run.log({
             "loss": loss,
@@ -587,6 +619,8 @@ class TossLoraModule(TOSS):
             "mse_loss": mse_loss,
             "geometry_loss": geom_loss,
             "depth_loss": depth_loss,
+            "depth_loss_l1":   depth_loss_l1,
+            "depth_loss_grad": depth_loss_grad,
         })
         print(f"LOSS logged: total={loss.item():.4f}")
 
@@ -663,6 +697,26 @@ class TossLoraModule(TOSS):
                 # Log all multiview predictions
                 run.log({"multiview_predictions": wandb_images})
                 print(f"[VIS] Logged multiview predictions at step {self.global_step}")
+
+            if depth_pred_vis is not None:
+                depth_images = []
+                for i in range(min(4, depth_pred_vis.shape[0])):
+                    pred_d = depth_pred_vis[i, 0].cpu().float().numpy()
+                    gt_d   = gt_depth_vis[i, 0].cpu().float().numpy()
+                    pred_d_norm = (pred_d - pred_d.min()) / (pred_d.max() - pred_d.min() + 1e-8)
+                    gt_d_norm   = (gt_d   - gt_d.min())   / (gt_d.max()   - gt_d.min()   + 1e-8)
+                    depth_images.append(wandb.Image(pred_d_norm, caption=f"Step {self.global_step} | Depth Pred [{i}]"))
+                    depth_images.append(wandb.Image(gt_d_norm,   caption=f"Step {self.global_step} | Depth GT [{i}]"))
+                run.log({"depth_predictions": depth_images})
+
+            if pred_normals_vis is not None:
+                normal_images = []
+                for i in range(min(4, pred_normals_vis.shape[0])):
+                    pred_n = ((pred_normals_vis[i] + 1) / 2).clamp(0, 1).permute(1, 2, 0).cpu().float().numpy()
+                    gt_n   = ((gt_normals_vis[i]   + 1) / 2).clamp(0, 1).permute(1, 2, 0).cpu().float().numpy()
+                    normal_images.append(wandb.Image(pred_n, caption=f"Step {self.global_step} | Normal Pred [{i}]"))
+                    normal_images.append(wandb.Image(gt_n,   caption=f"Step {self.global_step} | Normal GT [{i}]"))
+                run.log({"normal_predictions": normal_images})
 
         self.log("train_loss", loss, prog_bar=True, logger=True)
         return loss

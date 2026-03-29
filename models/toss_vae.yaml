@@ -54,6 +54,8 @@ model:
 
     # Depth head loss
     depth_loss_weight: 0.1
+    depth_l1_weight: 0.1
+    depth_grad_weight: 0.1
 
     scheduler_config: # 10000 warmup steps
       target: ldm.lr_scheduler.LambdaLinearScheduler
