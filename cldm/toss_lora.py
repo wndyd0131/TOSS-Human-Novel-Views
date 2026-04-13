@@ -87,12 +87,12 @@ class TossLoraModule(TOSS):
 
         # 3. Unfreeze PoseNet params
         pose_net_count = 0
-        for n, p in self.model.diffusion_model.named_parameters():
-            if "pose_net" in n:
-                p.requires_grad = True
-                pose_net_count += 1
-                print(f"[INIT] Unfreezing pose_net param: {n}, shape={p.shape}")
-        print(f"[INIT] Unfroze {pose_net_count} pose_net parameters")
+        # for n, p in self.model.diffusion_model.named_parameters():
+        #     if "pose_net" in n:
+        #         p.requires_grad = True
+        #         pose_net_count += 1
+        #         print(f"[INIT] Unfreezing pose_net param: {n}, shape={p.shape}")
+        # print(f"[INIT] Unfroze {pose_net_count} pose_net parameters")
         
         # 4. Explicitly enable gradients for LoRA parameters (in case PEFT didn't)
         lora_count = 0
@@ -107,15 +107,15 @@ class TossLoraModule(TOSS):
                 # This is essential for gradient flow - with lora_B=0, lora_A gets no gradients
                 if "lora_B" in n:
                     print(f"[INIT] lora_B before init: {n}, mean={p.abs().mean().item():.6e}")
-                    with torch.no_grad():
-                        # Use kaiming uniform like lora_A for balanced gradients
-                        nn.init.kaiming_uniform_(p, a=5**0.5)  # Same as lora_A default
-                        p.mul_(0.01)  # Scale down to not disrupt pretrained model too much
+                    # with torch.no_grad():
+                    #     # Use kaiming uniform like lora_A for balanced gradients
+                    #     nn.init.kaiming_uniform_(p, a=5**0.5)  # Same as lora_A default
+                    #     p.mul_(0.01)  # Scale down to not disrupt pretrained model too much
                     print(f"[INIT] lora_B after init: {n}, mean={p.abs().mean().item():.6e}")
                         
             # Also enable output layers if needed
-            if "base_model.model.out." in n:
-                p.requires_grad = True
+            # if "base_model.model.out." in n:
+            #     p.requires_grad = True
 
         print(f"[INIT] Enabled requires_grad for {lora_count} LoRA parameters")
         for name, shape, req_grad in lora_params_info:

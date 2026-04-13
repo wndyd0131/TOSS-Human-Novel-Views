@@ -3,8 +3,8 @@ model:
   # target: cldm.toss.TOSS
   params:
     lora_config_params:
-        r: 16
-        lora_alpha: 16
+        r: 64
+        lora_alpha: 64
 
         target_modules: [
             # Middle block
@@ -21,7 +21,13 @@ model:
             "output_blocks.11.1.transformer_blocks.0.attn1.to_q",
             "output_blocks.11.1.transformer_blocks.0.attn1.to_k",
             "output_blocks.11.1.transformer_blocks.0.attn1.to_v",
-        ]
+
+            # Output layer
+            "output_blocks.9.0.out_layers.3",
+            "output_blocks.10.0.out_layers.3",
+            "output_blocks.11.0.out_layers.3",
+            "middle_block.0.out_layers.3"
+            ]
 
         lora_dropout: 0.05
         bias: "none"
