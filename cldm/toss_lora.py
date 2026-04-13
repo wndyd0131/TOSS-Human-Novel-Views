@@ -389,25 +389,6 @@ class TossLoraModule(TOSS):
             # Register a hook to check LoRA layer output
             self._register_lora_debug_hook()
 
-        # Ensure model is in training mode
-        self.model.diffusion_model.train()
-        
-        # CRITICAL: Explicitly enable LoRA adapters for PEFT
-        if hasattr(self.model.diffusion_model, 'enable_adapters'):
-            self.model.diffusion_model.enable_adapters()
-        
-        # Debug: verify LoRA is active on first step
-        if batch_idx == 0 and self.global_step == 0:
-            print(f"[TRAIN] Training step 0, verifying LoRA setup...")
-            lora_active = 0
-            for n, m in self.model.diffusion_model.named_modules():
-                if 'lora' in n.lower():
-                    lora_active += 1
-            print(f"[TRAIN] Found {lora_active} LoRA modules in forward path")
-            
-            # Register a hook to check LoRA layer output
-            self._register_lora_debug_hook()
-
         x, cond = self.get_input(batch, self.first_stage_key)
 
         print("DEBUG_DELTA_POSE:", cond['delta_pose'][0])
@@ -421,15 +402,6 @@ class TossLoraModule(TOSS):
         model_output = self.apply_model(x_noisy, t, cond)
 
         target = noise
-
-        '''MSE Loss'''
-        # loss = (model_output - target) ** 2
-        # print("LOSS shape 1:", loss.shape)
-        # loss = F.mse_loss(model_output, target, reduction="mean")
-        # print("LOSS shape 2:", loss.shape)
-        # # if torch.rand(1) < 0.1:
-        # #     cond['in_concat'][0] = torch.zeros_like(cond['in_concat'][0])
-        # # loss, loss_dict = self.forward(x, cond)
 
         '''Perceptual Loss Computation'''
         # Predict x0 from the noise prediction using the diffusion formula:
@@ -453,55 +425,34 @@ class TossLoraModule(TOSS):
         self.lpips_loss = self.lpips_loss.to(pred_img.device)
         perceptual_loss = self.lpips_loss(pred_img, gt_img).mean()
 
-        # Optional: small MSE component on noise for training stability
         mse_loss = F.mse_loss(model_output, target, reduction="mean")
 
-        '''Combine Loss'''
-        loss = self.perceptual_weight * perceptual_loss + self.mse_weight * mse_loss
-        print(f"LOSS: perceptual={perceptual_loss.item():.4f}, mse={mse_loss.item():.4f}, total={loss.item():.4f}")
+        '''Masked Loss'''
+        mask = batch.get("mask")  # Original mask [B, 1, 256, 256]
 
-
-        mask = batch.get("mask") # Original mask [B, 1, 256, 256]        
-
-        '''Latent mask (MSE)'''
-        # if mask is not None:
-        #     # latent_mask = F.interpolate(mask, size=loss.shape[-2:], mode="area")
-        #     soft_mask = mask * (1.0 - self.mask_min_weight) + self.mask_min_weight  # Range: [min_weight, 1.0]
-        #     latent_mask = F.interpolate(soft_mask, size=model_output.shape[-2:], mode="area")
-            
-        #     # loss = loss * latent_mask
-        #     # loss = loss.sum() / (latent_mask.sum() + 1e-8)
-        #     loss = (F.mse_loss(model_output, noise, reduction="none") * latent_mask).sum() / (latent_mask.sum() + 1e-8)
-        # else:
-        #     loss = loss.mean()
-
-        '''Latent mask (Perceptual)'''
         if mask is not None:
-            # ===== Soft Mask =====
-            # Convert binary mask to soft mask so non-masked regions still contribute
-            # mask=1 (face) -> weight=1.0, mask=0 (background) -> weight=min_weight
-            soft_mask = mask * (1.0 - self.mask_min_weight) + self.mask_min_weight  # Range: [min_weight, 1.0]
-            
-            # For perceptual loss with mask, we need to apply mask in image space
+            mask = mask.to(self.device)
+            # Soft mask: mask=1 (face) -> weight=1.0, mask=0 (background) -> weight=min_weight
+            soft_mask = mask * (1.0 - self.mask_min_weight) + self.mask_min_weight
+
+            # Masked perceptual loss: mask images before LPIPS so it focuses on head
             img_mask = F.interpolate(soft_mask, size=pred_img.shape[-2:], mode="bilinear", align_corners=False)
-            
-            # Masked perceptual loss: compute per-pixel LPIPS isn't straightforward,
-            # so we use a masked MSE on decoded images as an approximation
-            masked_img_loss = (F.mse_loss(pred_img, gt_img, reduction="none") * img_mask).mean()
-            
-            # Also apply mask to latent MSE
+            masked_perceptual_loss = self.lpips_loss(pred_img * img_mask, gt_img * img_mask).mean()
+
+            # Masked latent MSE, normalized by mask sum to avoid diluting head signal
             latent_mask = F.interpolate(soft_mask, size=model_output.shape[-2:], mode="area")
-            masked_mse_loss = (F.mse_loss(model_output, noise, reduction="none") * latent_mask).mean()
-            
-            # Combine masked losses
-            loss = self.perceptual_weight * masked_img_loss + self.mse_weight * masked_mse_loss
-            print(f"MASKED LOSS: img={masked_img_loss.item():.4f}, mse={masked_mse_loss.item():.4f}")
+            masked_mse_loss = (F.mse_loss(model_output, noise, reduction="none") * latent_mask).sum() / latent_mask.sum()
+
+            loss = self.perceptual_weight * masked_perceptual_loss + self.mse_weight * masked_mse_loss
+            print(f"MASKED LOSS: perceptual={masked_perceptual_loss.item():.4f}, mse={masked_mse_loss.item():.4f}")
+        else:
+            loss = self.perceptual_weight * perceptual_loss + self.mse_weight * mse_loss
+            print(f"LOSS: perceptual={perceptual_loss.item():.4f}, mse={mse_loss.item():.4f}, total={loss.item():.4f}")
 
         ''' Geometry loss (frozen DPT-Hybrid proxy) '''
+        geom_loss = torch.tensor(0.0, device=self.device)
         if self.geometry_loss_weight > 0 and "normal" in batch and "normal_mask" in batch:
-            x0_pred = x - model_output
-            pred_imgs = self.decode_first_stage(x0_pred)
-            pred_imgs = torch.clamp((pred_imgs + 1) / 2, 0, 1)
+            pred_imgs = torch.clamp((pred_img + 1) / 2, 0, 1)
             if pred_imgs.ndim == 4 and pred_imgs.shape[-1] == 3:
                 pred_imgs = pred_imgs.permute(0, 3, 1, 2)
             pred_normals = self.normal_estimator(pred_imgs)
@@ -514,7 +465,7 @@ class TossLoraModule(TOSS):
             "loss": loss,
             "perceptual_loss": perceptual_loss,
             "mse_loss": mse_loss,
-            "geometry_loss": geom_loss
+            "geometry_loss": geom_loss,
         })
         print(f"LOSS logged: total={loss.item():.4f}")
 
