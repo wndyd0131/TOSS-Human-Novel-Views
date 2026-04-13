@@ -519,7 +519,7 @@ class TossLoraModule(TOSS):
         print(f"LOSS logged: total={loss.item():.4f}")
 
         '''WanDB logging'''
-        if batch_idx % 500 == 0:
+        if batch_idx % 50 == 0:
             # Generate 4 multiview predictions from a single source image
             with torch.no_grad():
                 import math

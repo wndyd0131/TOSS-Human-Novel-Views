@@ -40,7 +40,7 @@ model:
     conditioning_key: crossattn
     monitor: val/loss_simple_ema
     scale_factor: 0.18215
-    use_ema: True
+    use_ema: False
     only_mid_control: False
     ucg_txt: 0.5
     max_timesteps: 1000
