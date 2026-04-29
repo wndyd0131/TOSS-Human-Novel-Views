@@ -3,31 +3,82 @@ model:
   # target: cldm.toss.TOSS
   params:
     lora_config_params:
-        r: 64
-        lora_alpha: 64
+        r: 16
+        lora_alpha: 16
 
         target_modules: [
-            # Middle block
+            # Input blocks 1-2 (32x32, highest resolution)
+            "input_blocks.1.1.transformer_blocks.0.attn1.to_q",
+            "input_blocks.1.1.transformer_blocks.0.attn1.to_k",
+            "input_blocks.1.1.transformer_blocks.0.attn1.to_v",
+            "input_blocks.1.1.transformer_blocks.0.attn1.to_out.0",
+            "input_blocks.2.1.transformer_blocks.0.attn1.to_q",
+            "input_blocks.2.1.transformer_blocks.0.attn1.to_k",
+            "input_blocks.2.1.transformer_blocks.0.attn1.to_v",
+            "input_blocks.2.1.transformer_blocks.0.attn1.to_out.0",
+            # Input blocks 4-5 (16x16)
+            "input_blocks.4.1.transformer_blocks.0.attn1.to_q",
+            "input_blocks.4.1.transformer_blocks.0.attn1.to_k",
+            "input_blocks.4.1.transformer_blocks.0.attn1.to_v",
+            "input_blocks.4.1.transformer_blocks.0.attn1.to_out.0",
+            "input_blocks.5.1.transformer_blocks.0.attn1.to_q",
+            "input_blocks.5.1.transformer_blocks.0.attn1.to_k",
+            "input_blocks.5.1.transformer_blocks.0.attn1.to_v",
+            "input_blocks.5.1.transformer_blocks.0.attn1.to_out.0",
+            # Input blocks 7-8 (8x8)
+            "input_blocks.7.1.transformer_blocks.0.attn1.to_q",
+            "input_blocks.7.1.transformer_blocks.0.attn1.to_k",
+            "input_blocks.7.1.transformer_blocks.0.attn1.to_v",
+            "input_blocks.7.1.transformer_blocks.0.attn1.to_out.0",
+            "input_blocks.8.1.transformer_blocks.0.attn1.to_q",
+            "input_blocks.8.1.transformer_blocks.0.attn1.to_k",
+            "input_blocks.8.1.transformer_blocks.0.attn1.to_v",
+            "input_blocks.8.1.transformer_blocks.0.attn1.to_out.0",
+            # Middle block (8x8, bottleneck)
             "middle_block.1.transformer_blocks.0.attn1.to_q",
             "middle_block.1.transformer_blocks.0.attn1.to_k",
             "middle_block.1.transformer_blocks.0.attn1.to_v",
-            # High-resolution output blocks - important for facial details
+            "middle_block.1.transformer_blocks.0.attn1.to_out.0",
+            # Output blocks 3-5 (8x8 -> 16x16)
+            "output_blocks.3.1.transformer_blocks.0.attn1.to_q",
+            "output_blocks.3.1.transformer_blocks.0.attn1.to_k",
+            "output_blocks.3.1.transformer_blocks.0.attn1.to_v",
+            "output_blocks.3.1.transformer_blocks.0.attn1.to_out.0",
+            "output_blocks.4.1.transformer_blocks.0.attn1.to_q",
+            "output_blocks.4.1.transformer_blocks.0.attn1.to_k",
+            "output_blocks.4.1.transformer_blocks.0.attn1.to_v",
+            "output_blocks.4.1.transformer_blocks.0.attn1.to_out.0",
+            "output_blocks.5.1.transformer_blocks.0.attn1.to_q",
+            "output_blocks.5.1.transformer_blocks.0.attn1.to_k",
+            "output_blocks.5.1.transformer_blocks.0.attn1.to_v",
+            "output_blocks.5.1.transformer_blocks.0.attn1.to_out.0",
+            # Output blocks 6-8 (16x16 -> 32x32)
+            "output_blocks.6.1.transformer_blocks.0.attn1.to_q",
+            "output_blocks.6.1.transformer_blocks.0.attn1.to_k",
+            "output_blocks.6.1.transformer_blocks.0.attn1.to_v",
+            "output_blocks.6.1.transformer_blocks.0.attn1.to_out.0",
+            "output_blocks.7.1.transformer_blocks.0.attn1.to_q",
+            "output_blocks.7.1.transformer_blocks.0.attn1.to_k",
+            "output_blocks.7.1.transformer_blocks.0.attn1.to_v",
+            "output_blocks.7.1.transformer_blocks.0.attn1.to_out.0",
+            "output_blocks.8.1.transformer_blocks.0.attn1.to_q",
+            "output_blocks.8.1.transformer_blocks.0.attn1.to_k",
+            "output_blocks.8.1.transformer_blocks.0.attn1.to_v",
+            "output_blocks.8.1.transformer_blocks.0.attn1.to_out.0",
+            # Output blocks 9-11 (32x32, highest resolution)
             "output_blocks.9.1.transformer_blocks.0.attn1.to_q",
             "output_blocks.9.1.transformer_blocks.0.attn1.to_k",
             "output_blocks.9.1.transformer_blocks.0.attn1.to_v",
+            "output_blocks.9.1.transformer_blocks.0.attn1.to_out.0",
             "output_blocks.10.1.transformer_blocks.0.attn1.to_q",
             "output_blocks.10.1.transformer_blocks.0.attn1.to_k",
             "output_blocks.10.1.transformer_blocks.0.attn1.to_v",
+            "output_blocks.10.1.transformer_blocks.0.attn1.to_out.0",
             "output_blocks.11.1.transformer_blocks.0.attn1.to_q",
             "output_blocks.11.1.transformer_blocks.0.attn1.to_k",
             "output_blocks.11.1.transformer_blocks.0.attn1.to_v",
-
-            # Output layer
-            "output_blocks.9.0.out_layers.3",
-            "output_blocks.10.0.out_layers.3",
-            "output_blocks.11.0.out_layers.3",
-            "middle_block.0.out_layers.3"
-            ]
+            "output_blocks.11.1.transformer_blocks.0.attn1.to_out.0",
+        ]
 
         lora_dropout: 0.05
         bias: "none"

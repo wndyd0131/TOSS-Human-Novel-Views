@@ -87,12 +87,15 @@ class TossLoraModule(TOSS):
 
         # 3. Unfreeze PoseNet params
         pose_net_count = 0
-        # for n, p in self.model.diffusion_model.named_parameters():
-        #     if "pose_net" in n:
-        #         p.requires_grad = True
-        #         pose_net_count += 1
-        #         print(f"[INIT] Unfreezing pose_net param: {n}, shape={p.shape}")
-        # print(f"[INIT] Unfroze {pose_net_count} pose_net parameters")
+        for n, p in self.model.diffusion_model.named_parameters():
+            if "pose_net" in n:
+                p.requires_grad = True
+                pose_net_count += 1
+                print(f"[INIT] Unfreezing pose_net param: {n}, shape={p.shape}")
+            if "vae_proj" in n:
+                p.requires_grad = True
+        print(f"[INIT] Unfroze {pose_net_count} pose_net parameters")
+        print(f"[INIT] Unfroze vae_proj parameters")
         
         # 4. Explicitly enable gradients for LoRA parameters (in case PEFT didn't)
         lora_count = 0
@@ -403,32 +406,34 @@ class TossLoraModule(TOSS):
 
         target = noise
 
-        '''Perceptual Loss Computation'''
-        # Predict x0 from the noise prediction using the diffusion formula:
-        # x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * noise
-        # => x_0 = (x_t - sqrt(1 - alpha_bar_t) * predicted_noise) / sqrt(alpha_bar_t)
-        sqrt_alphas_cumprod = self.sqrt_alphas_cumprod[t][:, None, None, None]
-        sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod[t][:, None, None, None]
+        perceptual_loss = None
+        # '''Perceptual Loss Computation'''
+        # # Predict x0 from the noise prediction using the diffusion formula:
+        # # x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * noise
+        # # => x_0 = (x_t - sqrt(1 - alpha_bar_t) * predicted_noise) / sqrt(alpha_bar_t)
+        # sqrt_alphas_cumprod = self.sqrt_alphas_cumprod[t][:, None, None, None]
+        # sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod[t][:, None, None, None]
         
-        # Predict x0 from model's noise prediction
-        pred_x0 = (x_noisy - sqrt_one_minus_alphas_cumprod * model_output) / sqrt_alphas_cumprod
-        # Ground truth x0
-        gt_x0 = x  # The clean latent we started with
+        # # Predict x0 from model's noise prediction
+        # pred_x0 = (x_noisy - sqrt_one_minus_alphas_cumprod * model_output) / sqrt_alphas_cumprod
+        # # Ground truth x0
+        # gt_x0 = x  # The clean latent we started with
         
-        # Decode to image space for perceptual loss
-        # Use torch.no_grad for decoder to save memory (only need gradients through encoder path)
-        pred_img = self.decode_first_stage(pred_x0)  # [-1, 1] range
-        gt_img = self.decode_first_stage(gt_x0)  # [-1, 1] range
+        # # Decode to image space for perceptual loss
+        # # Use torch.no_grad for decoder to save memory (only need gradients through encoder path)
+        # pred_img = self.decode_first_stage(pred_x0)  # [-1, 1] range
+        # gt_img = self.decode_first_stage(gt_x0)  # [-1, 1] range
         
-        # Compute perceptual loss (LPIPS expects [-1, 1] range)
-        # Move LPIPS to same device as images
-        self.lpips_loss = self.lpips_loss.to(pred_img.device)
-        perceptual_loss = self.lpips_loss(pred_img, gt_img).mean()
+        # # Compute perceptual loss (LPIPS expects [-1, 1] range)
+        # # Move LPIPS to same device as images
+        # self.lpips_loss = self.lpips_loss.to(pred_img.device)
+        # perceptual_loss = self.lpips_loss(pred_img, gt_img).mean()
 
         mse_loss = F.mse_loss(model_output, target, reduction="mean")
 
         '''Masked Loss'''
-        mask = batch.get("mask")  # Original mask [B, 1, 256, 256]
+        mask = None
+        # mask = batch.get("mask")  # Original mask [B, 1, 256, 256]
 
         if mask is not None:
             mask = mask.to(self.device)
@@ -445,27 +450,29 @@ class TossLoraModule(TOSS):
 
             loss = self.perceptual_weight * masked_perceptual_loss + self.mse_weight * masked_mse_loss
             print(f"MASKED LOSS: perceptual={masked_perceptual_loss.item():.4f}, mse={masked_mse_loss.item():.4f}")
-        else:
+        elif perceptual_loss is not None and mse_loss is not None:
             loss = self.perceptual_weight * perceptual_loss + self.mse_weight * mse_loss
             print(f"LOSS: perceptual={perceptual_loss.item():.4f}, mse={mse_loss.item():.4f}, total={loss.item():.4f}")
+        else:
+            loss = mse_loss
 
-        ''' Geometry loss (frozen DPT-Hybrid proxy) '''
-        geom_loss = torch.tensor(0.0, device=self.device)
-        if self.geometry_loss_weight > 0 and "normal" in batch and "normal_mask" in batch:
-            pred_imgs = torch.clamp((pred_img + 1) / 2, 0, 1)
-            if pred_imgs.ndim == 4 and pred_imgs.shape[-1] == 3:
-                pred_imgs = pred_imgs.permute(0, 3, 1, 2)
-            pred_normals = self.normal_estimator(pred_imgs)
-            gt_normals = batch["normal"].to(self.device)
-            normal_mask = batch["normal_mask"].to(self.device)
-            geom_loss = _cosine_similarity_loss(pred_normals, gt_normals, normal_mask)
-            loss = loss + self.geometry_loss_weight * geom_loss
+        # ''' Geometry loss (frozen DPT-Hybrid proxy) '''
+        # geom_loss = torch.tensor(0.0, device=self.device)
+        # if self.geometry_loss_weight > 0 and "normal" in batch and "normal_mask" in batch:
+        #     pred_imgs = torch.clamp((pred_img + 1) / 2, 0, 1)
+        #     if pred_imgs.ndim == 4 and pred_imgs.shape[-1] == 3:
+        #         pred_imgs = pred_imgs.permute(0, 3, 1, 2)
+        #     pred_normals = self.normal_estimator(pred_imgs)
+        #     gt_normals = batch["normal"].to(self.device)
+        #     normal_mask = batch["normal_mask"].to(self.device)
+        #     geom_loss = _cosine_similarity_loss(pred_normals, gt_normals, normal_mask)
+        #     loss = loss + self.geometry_loss_weight * geom_loss
 
         run.log({
             "loss": loss,
-            "perceptual_loss": perceptual_loss,
+            # "perceptual_loss": perceptual_loss,
             "mse_loss": mse_loss,
-            "geometry_loss": geom_loss,
+            # "geometry_loss": geom_loss,
         })
         print(f"LOSS logged: total={loss.item():.4f}")
 
@@ -493,8 +500,7 @@ class TossLoraModule(TOSS):
                 
                 wandb_images = []
                 
-                # Add source image first
-                wandb_images.append(wandb.Image(
+                wandb_images.append(wandb.Image( # Add source image first
                     source_img_display[0],
                     caption=f"Step {self.global_step} | SOURCE"
                 ))
@@ -502,25 +508,21 @@ class TossLoraModule(TOSS):
                 # Generate prediction for each pose
                 for yaw_deg in yaw_angles_deg:
                     yaw_rad = math.radians(yaw_deg)
-                    # Create pose: [pitch, yaw, distance]
-                    delta_pose_mv = torch.tensor([[0.0, yaw_rad, 0.0]], device=self.device)
+                    delta_pose_mv = torch.tensor([[0.0, yaw_rad, 0.0]], device=self.device) # Create pose: [pitch, yaw, distance]
                     
-                    # Create conditioning dict for this pose
-                    cond_mv = {
+                    cond_mv = { # Create conditioning dict for this pose
                         'c_crossattn': [c_text],
                         'c_concat': [source_img],
                         'in_concat': [source_latent],
                         'delta_pose': delta_pose_mv
                     }
                     
-                    # Sample using DDIM for faster inference
-                    from ldm.models.diffusion.ddim import DDIMSampler
+                    from ldm.models.diffusion.ddim import DDIMSampler # Sample using DDIM for faster inference
                     sampler = DDIMSampler(self)
                     
                     shape = [4, source_img.shape[2] // 8, source_img.shape[3] // 8]
                     
-                    # Use fewer steps for visualization (faster)
-                    samples, _ = sampler.sample(
+                    samples, _ = sampler.sample( # Use fewer steps for visualization (faster)
                         S=20,  # Quick sampling
                         batch_size=1,
                         shape=shape,
@@ -530,8 +532,7 @@ class TossLoraModule(TOSS):
                         eta=0.0
                     )
                     
-                    # Decode to image
-                    pred_img = self.decode_first_stage(samples)
+                    pred_img = self.decode_first_stage(samples) # Decode to image
                     pred_img = torch.clamp((pred_img + 1) / 2, 0, 1)
                     
                     wandb_images.append(wandb.Image(
@@ -600,7 +601,7 @@ class TossLoraModule(TOSS):
     def configure_optimizers(self):
         # Explicitly collect LoRA and pose_net params separately
         lora_params = []
-        pose_net_params = []
+        finetune_params = []
         other_params = []
         
         # Use named_parameters to ensure we get the actual parameter objects
@@ -610,17 +611,21 @@ class TossLoraModule(TOSS):
                     lora_params.append(p)
                     print(f"[OPT] LoRA param: {n}, shape={p.shape}")
                 elif "pose_net" in n:
-                    pose_net_params.append(p)
+                    finetune_params.append(p)
                     print(f"[OPT] pose_net param: {n}, shape={p.shape}")
+                elif "vae_proj" in n:
+                    finetune_params.append(p)
+                elif "base_model.model.out." in n:
+                    finetune_params.append(p)
                 else:
                     other_params.append(p)
                     print(f"[OPT] Other param: {n}, shape={p.shape}")
         
         print(f"\n[OPT] Summary:")
         print(f"  LoRA params: {len(lora_params)}")
-        print(f"  pose_net params: {len(pose_net_params)}")
+        print(f"  finetune params: {len(finetune_params)}")
         print(f"  Other trainable params: {len(other_params)}")
-        print(f"  Total params in optimizer: {len(lora_params) + len(pose_net_params) + len(other_params)}")
+        print(f"  Total params in optimizer: {len(lora_params) + len(finetune_params) + len(other_params)}")
         
         if len(lora_params) == 0:
             print("[WARNING] No LoRA params found! Check if PEFT is properly configured.")
@@ -635,12 +640,9 @@ class TossLoraModule(TOSS):
         param_groups = [
             {"params": lora_params, "lr": self.learning_rate, "name": "lora"},
         ]
-        
-        if len(pose_net_params) > 0:
-            pose_net_lr = self.learning_rate * 0.1  # 10x lower than LoRA
-            param_groups.append({"params": pose_net_params, "lr": pose_net_lr, "name": "pose_net"})
-            print(f"[OPT] pose_net learning rate: {pose_net_lr} (0.1x of LoRA lr: {self.learning_rate})")
-        
+
+        if len(finetune_params) > 0:
+            param_groups.append({"params": finetune_params, "lr": self.learning_rate * 0.1, "name": "finetune"})
         if len(other_params) > 0:
             param_groups.append({"params": other_params, "lr": self.learning_rate, "name": "other"})
         
