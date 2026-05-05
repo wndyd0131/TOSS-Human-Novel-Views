@@ -104,6 +104,10 @@ class TossLoraModule(TOSS):
                 lora_count += 1
                 lora_params_info.append((n, p.shape, p.requires_grad))
 
+            # Also enable output layers if needed
+            if "base_model.model.out." in n:
+                p.requires_grad = True
+
         print(f"[INIT] Enabled requires_grad for {lora_count} LoRA parameters")
         for name, shape, req_grad in lora_params_info:
             print(f"  -> {name}: shape={shape}, requires_grad={req_grad}")
@@ -204,7 +208,7 @@ class TossLoraModule(TOSS):
         }
 
         '''WanDB logging'''
-        if batch_idx % 50 == 0:
+        if self.global_step % 50 == 0:
             # Generate 4 multiview predictions from a single source image
             with torch.no_grad():
                 import math
