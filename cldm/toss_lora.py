@@ -27,6 +27,12 @@ def _cosine_similarity_loss(pred_normals, gt_normals, mask, eps=1e-8):
         return loss.sum() / (mask.sum() + eps)
     return loss.mean()
 
+def _normal_to_rgb_vis(norm):
+    """Map unit normal field to RGB in [0,1] for visualization. norm: [B,3,H,W] or [3,H,W]. Returns [3,H,W]."""
+    if norm.dim() == 4:
+        norm = norm[0]
+    return torch.clamp((norm + 1) / 2, 0, 1)
+
 class TossLoraModule(TOSS):
     def __init__(self, lora_config_params, *args, normal_estimator_path="hf:clay3d/omnidata", geometry_loss_weight=0.1, **kwargs):
         kwargs.pop("lora_config_params", None)  # consumed by us
@@ -106,20 +112,6 @@ class TossLoraModule(TOSS):
                 lora_count += 1
                 lora_params_info.append((n, p.shape, p.requires_grad))
 
-                # Initialize lora_B with small but meaningful values
-                # This is essential for gradient flow - with lora_B=0, lora_A gets no gradients
-                if "lora_B" in n:
-                    print(f"[INIT] lora_B before init: {n}, mean={p.abs().mean().item():.6e}")
-                    # with torch.no_grad():
-                    #     # Use kaiming uniform like lora_A for balanced gradients
-                    #     nn.init.kaiming_uniform_(p, a=5**0.5)  # Same as lora_A default
-                    #     p.mul_(0.01)  # Scale down to not disrupt pretrained model too much
-                    print(f"[INIT] lora_B after init: {n}, mean={p.abs().mean().item():.6e}")
-                        
-            # Also enable output layers if needed
-            # if "base_model.model.out." in n:
-            #     p.requires_grad = True
-
         print(f"[INIT] Enabled requires_grad for {lora_count} LoRA parameters")
         for name, shape, req_grad in lora_params_info:
             print(f"  -> {name}: shape={shape}, requires_grad={req_grad}")
@@ -131,13 +123,6 @@ class TossLoraModule(TOSS):
             print(f"[INIT] PEFT config active: {self.model.diffusion_model.peft_config}")
         else:
             print("[WARNING] No peft_config found - PEFT may not be properly initialized!")
-        
-        # Debug: Check LoRA layer scaling and adapter status
-        self._debug_lora_setup()
-        
-        # Debug: Check pose_net weights
-        self._debug_pose_net_weights()
-
 
         # Initialize perceptual loss (LPIPS)
         self.lpips_loss = lpips.LPIPS(net='vgg').eval()
@@ -149,54 +134,6 @@ class TossLoraModule(TOSS):
         self.mse_weight = 0.1  # Small MSE component for stability
         self.mask_min_weight = 0.2  # Soft mask: background contributes 20%, face contributes 100%
 
-        # Debug: Check LoRA layer scaling and adapter status
-        self._debug_lora_setup()
-        self._debug_pose_net_weights()
-
-    def _debug_pose_net_weights(self):
-        """Debug helper to inspect pose_net weights"""
-        print("\n[DEBUG] Pose Net Weight Analysis:")
-        
-        # Access pose_net (may be wrapped by PEFT)
-        unet = self.model.diffusion_model
-        pose_net = None
-        
-        # Try to find pose_net in the model
-        if hasattr(unet, 'base_model'):
-            # PEFT wrapped model
-            if hasattr(unet.base_model, 'model') and hasattr(unet.base_model.model, 'pose_net'):
-                pose_net = unet.base_model.model.pose_net
-        elif hasattr(unet, 'pose_net'):
-            pose_net = unet.pose_net
-        
-        if pose_net is None:
-            print("  [WARNING] pose_net not found!")
-            return
-        
-        print(f"  pose_net structure: {pose_net}")
-        print(f"  pose_enc type: {getattr(unet.base_model.model if hasattr(unet, 'base_model') else unet, 'pose_enc', 'unknown')}")
-        
-        # Iterate through pose_net layers
-        for name, param in pose_net.named_parameters():
-            print(f"\n  Layer: pose_net.{name}")
-            print(f"    shape: {param.shape}")
-            print(f"    requires_grad: {param.requires_grad}")
-            print(f"    mean: {param.data.mean().item():.6f}")
-            print(f"    std: {param.data.std().item():.6f}")
-            print(f"    min: {param.data.min().item():.6f}")
-            print(f"    max: {param.data.max().item():.6f}")
-            print(f"    abs_mean: {param.data.abs().mean().item():.6f}")
-            
-            # Check if weights look initialized (not all zeros)
-            if param.data.abs().sum() == 0:
-                print(f"    [WARNING] All zeros - may not be loaded properly!")
-            
-        # Print input/output dimensions
-        if hasattr(pose_net, '0') and hasattr(pose_net[0], 'in_features'):
-            print(f"\n  Input features (pose_net[0].in_features): {pose_net[0].in_features}")
-        if hasattr(pose_net, '2') and hasattr(pose_net[2], 'out_features'):
-            print(f"  Output features (pose_net[2].out_features): {pose_net[2].out_features}")
-
     @property
     def normal_estimator(self):
         """Lazy-load frozen DPT-Hybrid normal estimator."""
@@ -205,130 +142,6 @@ class TossLoraModule(TOSS):
             self._normal_estimator = DPTNormalInference(self.normal_estimator_path).to(self.device)
             print(f"[INIT] Loaded DPT-Hybrid normal estimator from {self.normal_estimator_path}")
         return self._normal_estimator
-
-    def _register_lora_debug_hook(self):
-        """Register hooks to debug LoRA forward pass"""
-        from peft.tuners.lora import Linear as LoraLinear
-        
-        def make_hook(name):
-            def hook(module, input, output):
-                # Check if LoRA is actually contributing
-                if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
-                    x = input[0]
-                    for adapter_name in module.lora_A.keys():
-                        lora_A = module.lora_A[adapter_name]
-                        lora_B = module.lora_B[adapter_name]
-                        scaling = module.scaling.get(adapter_name, 1.0)
-                        
-                        # Compute LoRA contribution manually
-                        lora_out = lora_B(lora_A(x)) * scaling
-                        
-                        print(f"\n[HOOK] {name}:")
-                        print(f"  input mean: {x.abs().mean().item():.6f}")
-                        print(f"  lora_A(x) mean: {lora_A(x).abs().mean().item():.6f}")
-                        print(f"  lora_B(lora_A(x)) mean: {lora_B(lora_A(x)).abs().mean().item():.6f}")
-                        print(f"  scaling: {scaling}")
-                        print(f"  lora_contribution mean: {lora_out.abs().mean().item():.6f}")
-                        print(f"  output mean: {output.abs().mean().item():.6f}")
-                        break
-            return hook
-        
-        # Find and hook one LoRA layer
-        for name, module in self.model.diffusion_model.named_modules():
-            if isinstance(module, LoraLinear) and 'to_q' in name:
-                module.register_forward_hook(make_hook(name))
-                print(f"[DEBUG] Registered forward hook on {name}")
-                
-                # Also register backward hook on the lora_B weight
-                for adapter_name in module.lora_B.keys():
-                    lora_B = module.lora_B[adapter_name]
-                    def backward_hook(grad):
-                        print(f"\n[BACKWARD HOOK] lora_B gradient received!")
-                        print(f"  grad shape: {grad.shape if grad is not None else None}")
-                        print(f"  grad mean: {grad.abs().mean().item() if grad is not None else None}")
-                        return grad
-                    lora_B.weight.register_hook(backward_hook)
-                    print(f"[DEBUG] Registered backward hook on lora_B.weight")
-                    break
-                break
-
-    def _debug_lora_setup(self):
-        """Debug helper to verify LoRA is properly configured"""
-        from peft.tuners.lora import LoraLayer
-        
-        print("\n[DEBUG] LoRA Layer Analysis:")
-        for name, module in self.model.diffusion_model.named_modules():
-            if isinstance(module, LoraLayer):
-                # Check scaling
-                scaling = getattr(module, 'scaling', {})
-                # Check if adapter is disabled
-                disable_adapters = getattr(module, 'disable_adapters', False)
-                # Check merged status  
-                merged = getattr(module, 'merged', False)
-                
-                print(f"  {name}:")
-                print(f"    scaling: {scaling}")
-                print(f"    disable_adapters: {disable_adapters}")
-                print(f"    merged: {merged}")
-                
-                # Check lora_A and lora_B
-                if hasattr(module, 'lora_A'):
-                    for adapter_name, lora_a in module.lora_A.items():
-                        print(f"    lora_A[{adapter_name}]: shape={lora_a.weight.shape}, requires_grad={lora_a.weight.requires_grad}")
-                if hasattr(module, 'lora_B'):
-                    for adapter_name, lora_b in module.lora_B.items():
-                        print(f"    lora_B[{adapter_name}]: shape={lora_b.weight.shape}, requires_grad={lora_b.weight.requires_grad}")
-                break  # Only check one to avoid spam
-        
-        # Check active adapter
-        if hasattr(self.model.diffusion_model, 'active_adapter'):
-            print(f"\n[DEBUG] Active adapter: {self.model.diffusion_model.active_adapter}")
-        if hasattr(self.model.diffusion_model, 'active_adapters'):
-            print(f"[DEBUG] Active adapters: {self.model.diffusion_model.active_adapters}")
-
-    def _debug_pose_net_weights(self):
-        """Debug helper to inspect pose_net weights"""
-        print("\n[DEBUG] Pose Net Weight Analysis:")
-        
-        # Access pose_net (may be wrapped by PEFT)
-        unet = self.model.diffusion_model
-        pose_net = None
-        
-        # Try to find pose_net in the model
-        if hasattr(unet, 'base_model'):
-            # PEFT wrapped model
-            if hasattr(unet.base_model, 'model') and hasattr(unet.base_model.model, 'pose_net'):
-                pose_net = unet.base_model.model.pose_net
-        elif hasattr(unet, 'pose_net'):
-            pose_net = unet.pose_net
-        
-        if pose_net is None:
-            print("  [WARNING] pose_net not found!")
-            return
-        
-        print(f"  pose_net structure: {pose_net}")
-        print(f"  pose_enc type: {getattr(unet.base_model.model if hasattr(unet, 'base_model') else unet, 'pose_enc', 'unknown')}")
-        
-        # Iterate through pose_net layers
-        for name, param in pose_net.named_parameters():
-            print(f"\n  Layer: pose_net.{name}")
-            print(f"    shape: {param.shape}")
-            print(f"    requires_grad: {param.requires_grad}")
-            print(f"    mean: {param.data.mean().item():.6f}")
-            print(f"    std: {param.data.std().item():.6f}")
-            print(f"    min: {param.data.min().item():.6f}")
-            print(f"    max: {param.data.max().item():.6f}")
-            print(f"    abs_mean: {param.data.abs().mean().item():.6f}")
-            
-            # Check if weights look initialized (not all zeros)
-            if param.data.abs().sum() == 0:
-                print(f"    [WARNING] All zeros - may not be loaded properly!")
-            
-        # Print input/output dimensions
-        if hasattr(pose_net, '0') and hasattr(pose_net[0], 'in_features'):
-            print(f"\n  Input features (pose_net[0].in_features): {pose_net[0].in_features}")
-        if hasattr(pose_net, '2') and hasattr(pose_net[2], 'out_features'):
-            print(f"  Output features (pose_net[2].out_features): {pose_net[2].out_features}")
 
     def on_save_checkpoint(self, checkpoint):
         # We override this to prevent the parent class from 
@@ -369,32 +182,7 @@ class TossLoraModule(TOSS):
         if hasattr(self.model.diffusion_model, 'enable_adapters'):
             self.model.diffusion_model.enable_adapters()
         
-        # Debug: verify LoRA is active on first step
-        if batch_idx == 0 and self.global_step == 0:
-            print(f"[TRAIN] Training step 0, verifying LoRA setup...")
-            lora_active = 0
-            for n, m in self.model.diffusion_model.named_modules():
-                if 'lora' in n.lower():
-                    lora_active += 1
-            print(f"[TRAIN] Found {lora_active} LoRA modules in forward path")
-            
-            # CRITICAL: Verify LoRA weights are non-zero
-            for n, p in self.model.diffusion_model.named_parameters():
-                if "lora" in n.lower():
-                    print(f"[TRAIN] {n}: mean={p.abs().mean().item():.6e}, requires_grad={p.requires_grad}")
-            
-            # Check adapter state
-            if hasattr(self.model.diffusion_model, 'active_adapters'):
-                print(f"[TRAIN] Active adapters: {self.model.diffusion_model.active_adapters}")
-            if hasattr(self.model.diffusion_model, 'disable_adapters'):
-                print(f"[TRAIN] disable_adapters attr: {getattr(self.model.diffusion_model, 'disable_adapters', 'N/A')}")
-
-            # Register a hook to check LoRA layer output
-            self._register_lora_debug_hook()
-
         x, cond = self.get_input(batch, self.first_stage_key)
-
-        print("DEBUG_DELTA_POSE:", cond['delta_pose'][0])
 
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
         noise = torch.randn_like(x)
@@ -406,34 +194,30 @@ class TossLoraModule(TOSS):
 
         target = noise
 
-        perceptual_loss = None
-        # '''Perceptual Loss Computation'''
-        # # Predict x0 from the noise prediction using the diffusion formula:
-        # # x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * noise
-        # # => x_0 = (x_t - sqrt(1 - alpha_bar_t) * predicted_noise) / sqrt(alpha_bar_t)
-        # sqrt_alphas_cumprod = self.sqrt_alphas_cumprod[t][:, None, None, None]
-        # sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod[t][:, None, None, None]
-        
-        # # Predict x0 from model's noise prediction
-        # pred_x0 = (x_noisy - sqrt_one_minus_alphas_cumprod * model_output) / sqrt_alphas_cumprod
-        # # Ground truth x0
-        # gt_x0 = x  # The clean latent we started with
-        
-        # # Decode to image space for perceptual loss
-        # # Use torch.no_grad for decoder to save memory (only need gradients through encoder path)
-        # pred_img = self.decode_first_stage(pred_x0)  # [-1, 1] range
-        # gt_img = self.decode_first_stage(gt_x0)  # [-1, 1] range
-        
-        # # Compute perceptual loss (LPIPS expects [-1, 1] range)
-        # # Move LPIPS to same device as images
-        # self.lpips_loss = self.lpips_loss.to(pred_img.device)
-        # perceptual_loss = self.lpips_loss(pred_img, gt_img).mean()
-
         mse_loss = F.mse_loss(model_output, target, reduction="mean")
 
+        '''Perceptual Loss'''
+        perceptual_loss = None
+        sqrt_alphas_cumprod = self.sqrt_alphas_cumprod[t][:, None, None, None]
+        sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod[t][:, None, None, None]
+        
+        pred_x0 = (x_noisy - sqrt_one_minus_alphas_cumprod * model_output) / sqrt_alphas_cumprod
+
+        gt_x0 = x  # The clean latent we started with
+        
+        # Decode to image space for perceptual loss
+        # Use torch.no_grad for decoder to save memory (only need gradients through encoder path)
+        pred_img = self.decode_first_stage(pred_x0)  # [-1, 1] range
+        gt_img = self.decode_first_stage(gt_x0)  # [-1, 1] range
+        
+        # Compute perceptual loss (LPIPS expects [-1, 1] range)
+        # Move LPIPS to same device as images
+        self.lpips_loss = self.lpips_loss.to(pred_img.device)
+        perceptual_loss = self.lpips_loss(pred_img, gt_img).mean()
+
         '''Masked Loss'''
-        mask = None
-        # mask = batch.get("mask")  # Original mask [B, 1, 256, 256]
+        # mask = None
+        mask = batch.get("mask")  # Original mask [B, 1, 256, 256]
 
         if mask is not None:
             mask = mask.to(self.device)
@@ -456,25 +240,24 @@ class TossLoraModule(TOSS):
         else:
             loss = mse_loss
 
-        # ''' Geometry loss (frozen DPT-Hybrid proxy) '''
-        # geom_loss = torch.tensor(0.0, device=self.device)
-        # if self.geometry_loss_weight > 0 and "normal" in batch and "normal_mask" in batch:
-        #     pred_imgs = torch.clamp((pred_img + 1) / 2, 0, 1)
-        #     if pred_imgs.ndim == 4 and pred_imgs.shape[-1] == 3:
-        #         pred_imgs = pred_imgs.permute(0, 3, 1, 2)
-        #     pred_normals = self.normal_estimator(pred_imgs)
-        #     gt_normals = batch["normal"].to(self.device)
-        #     normal_mask = batch["normal_mask"].to(self.device)
-        #     geom_loss = _cosine_similarity_loss(pred_normals, gt_normals, normal_mask)
-        #     loss = loss + self.geometry_loss_weight * geom_loss
+        ''' Geometry loss (frozen DPT-Hybrid proxy) '''
+        geom_loss = torch.tensor(0.0, device=self.device)
+        if self.geometry_loss_weight > 0 and "normal" in batch and "normal_mask" in batch:
+            pred_imgs = torch.clamp((pred_img + 1) / 2, 0, 1)
+            if pred_imgs.ndim == 4 and pred_imgs.shape[-1] == 3:
+                pred_imgs = pred_imgs.permute(0, 3, 1, 2)
+            pred_normals = self.normal_estimator(pred_imgs)
+            gt_normals = batch["normal"].to(self.device)
+            normal_mask = batch["normal_mask"].to(self.device)
+            geom_loss = _cosine_similarity_loss(pred_normals, gt_normals, normal_mask)
+            loss = loss + self.geometry_loss_weight * geom_loss
 
-        run.log({
+        wandb_log = {
             "loss": loss,
-            # "perceptual_loss": perceptual_loss,
+            "perceptual_loss": perceptual_loss,
             "mse_loss": mse_loss,
-            # "geometry_loss": geom_loss,
-        })
-        print(f"LOSS logged: total={loss.item():.4f}")
+            "geometry_loss": geom_loss,
+        }
 
         '''WanDB logging'''
         if batch_idx % 50 == 0:
@@ -499,11 +282,48 @@ class TossLoraModule(TOSS):
                 yaw_angles_deg = [-15, -5, 5, 15]
                 
                 wandb_images = []
+                normal_gt_and_preds = []
                 
                 wandb_images.append(wandb.Image( # Add source image first
                     source_img_display[0],
                     caption=f"Step {self.global_step} | SOURCE"
                 ))
+
+                if "normal" in batch and "normal_mask" in batch:
+                    gt_n = batch["normal"][:1].to(self.device)
+                    vis_gt = _normal_to_rgb_vis(gt_n)
+                    normal_gt_and_preds.append(
+                        wandb.Image(
+                            vis_gt,
+                            caption=f"Step {self.global_step} | GT normal (target view)",
+                        )
+                    )
+
+                    nm = batch["normal_mask"][:1].to(self.device).float()
+                    if nm.ndim == 4:
+                        nm = nm[0]
+                    m = nm[0] if nm.ndim == 3 else nm
+                    m = torch.clamp(m, 0, 1)
+                    m_vis = m.unsqueeze(0).expand(3, -1, -1)
+                    normal_gt_and_preds.append(
+                        wandb.Image(
+                            m_vis,
+                            caption=f"Step {self.global_step} | GT normal_mask",
+                        )
+                    )
+                    
+                    pred_imgs_nchw = pred_img
+                    if pred_imgs_nchw.ndim == 4 and pred_imgs_nchw.shape[-1] == 3:
+                        pred_imgs_nchw = pred_imgs_nchw.permute(0, 3, 1, 2)
+                    pred_normals_dpt = self.normal_estimator(pred_imgs_nchw)
+                    vis_n = _normal_to_rgb_vis(pred_normals_dpt)
+                    normal_gt_and_preds.append(
+                        wandb.Image(
+                            vis_n,
+                            caption=f"Step {self.global_step} | Normal pred (DPT) | Pred",
+                        )
+                    )
+
                 
                 # Generate prediction for each pose
                 for yaw_deg in yaw_angles_deg:
@@ -540,63 +360,16 @@ class TossLoraModule(TOSS):
                         caption=f"Step {self.global_step} | Yaw: {yaw_deg}°"
                     ))
                 
-                # Log all multiview predictions
-                run.log({"multiview_predictions": wandb_images})
-                print(f"[VIS] Logged multiview predictions at step {self.global_step}")
+                wandb_log["multiview_predictions"] = wandb_images
+                if normal_gt_and_preds:
+                    wandb_log["normal_gt_and_preds"] = normal_gt_and_preds
+                print(f"[VIS] Logged multiview (+ normals) at step {self.global_step}")
+
+        print(f"LOSS logged: total={loss.item():.4f}")
+        run.log(wandb_log, step=int(self.global_step))
 
         self.log("train_loss", loss, prog_bar=True, logger=True)
         return loss
-
-    def on_after_backward(self):
-        # Print every 50 steps for better visibility
-        if self.global_step % 50 == 0:
-            print(f"\n[GRAD CHECK] Step {self.global_step}")
-            
-            lora_grads = []
-            pose_net_grads = []
-            
-            for n, p in self.model.diffusion_model.named_parameters():
-                if not p.requires_grad:
-                    continue
-                    
-                if "lora" in n.lower():
-                    if p.grad is not None:
-                        grad_norm = p.grad.norm().item()
-                        grad_mean = p.grad.abs().mean().item()
-                        grad_max = p.grad.abs().max().item()
-                        lora_grads.append((n, grad_norm, grad_mean, grad_max))
-                    else:
-                        lora_grads.append((n, None, None, None))
-                        
-                elif "pose_net" in n:
-                    if p.grad is not None:
-                        grad_norm = p.grad.norm().item()
-                        pose_net_grads.append((n, grad_norm))
-                    else:
-                        pose_net_grads.append((n, None))
-            
-            # Print LoRA gradients
-            print(f"  LoRA params ({len(lora_grads)}):")
-            has_nonzero_grad = False
-            for name, norm, mean, max_val in lora_grads:
-                if norm is not None:
-                    if norm > 1e-10:
-                        has_nonzero_grad = True
-                    print(f"    {name.split('.')[-3]}: norm={norm:.2e}, mean={mean:.2e}, max={max_val:.2e}")
-                else:
-                    print(f"    {name.split('.')[-3]}: grad=None!")
-            
-            if not has_nonzero_grad:
-                print("  [WARNING] All LoRA gradients are zero or None!")
-            
-            # Print pose_net gradients  
-            print(f"  pose_net params ({len(pose_net_grads)}):")
-            for name, norm in pose_net_grads:
-                if norm is not None:
-                    print(f"    {name}: norm={norm:.2e}")
-                else:
-                    print(f"    {name}: grad=None!")
-
 
     def configure_optimizers(self):
         # Explicitly collect LoRA and pose_net params separately
