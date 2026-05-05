@@ -34,7 +34,7 @@ def _normal_to_rgb_vis(norm):
     return torch.clamp((norm + 1) / 2, 0, 1)
 
 class TossLoraModule(TOSS):
-    def __init__(self, lora_config_params, *args, normal_estimator_path="hf:clay3d/omnidata", geometry_loss_weight=0.1, **kwargs):
+    def __init__(self, lora_config_params, *args, normal_estimator_path="hf:clay3d/omnidata", geometry_loss_weight=0.0, **kwargs):
         kwargs.pop("lora_config_params", None)  # consumed by us
         self.normal_estimator_path = kwargs.pop("normal_estimator_path", normal_estimator_path)
         self.geometry_loss_weight = kwargs.pop("geometry_loss_weight", geometry_loss_weight)
@@ -57,14 +57,6 @@ class TossLoraModule(TOSS):
             },
         )
 
-        # Change pose_net in_feature channel from 51 to 16
-        # self.model.diffusion_model.pose_net = nn.Sequential(
-        #     nn.Linear(16, 320), # 51 -> 16
-        #     nn.SiLU(),
-        #     nn.Linear(320, 320)
-        # )
-
-        # Disable checkpoints
         unet = self.model.diffusion_model
         def disable_all_ckpt(m):
             for attr in ["use_checkpoint", "checkpoint", "use_checkpointing"]:
@@ -123,16 +115,11 @@ class TossLoraModule(TOSS):
             print(f"[INIT] PEFT config active: {self.model.diffusion_model.peft_config}")
         else:
             print("[WARNING] No peft_config found - PEFT may not be properly initialized!")
-
-        # Initialize perceptual loss (LPIPS)
-        self.lpips_loss = lpips.LPIPS(net='vgg').eval()
-        self.lpips_loss.requires_grad_(False)  # Freeze LPIPS network
-        print("[INIT] Initialized LPIPS perceptual loss (VGG backbone)")
         
         # Loss weights for hybrid loss
-        self.perceptual_weight = 1.0  # Weight for perceptual loss
-        self.mse_weight = 0.1  # Small MSE component for stability
-        self.mask_min_weight = 0.2  # Soft mask: background contributes 20%, face contributes 100%
+        # self.perceptual_weight = 0.0  # Weight for perceptual loss
+        self.mse_weight = 1.0  # Small MSE component for stability
+        # self.mask_min_weight = 0.2  # Soft mask: background contributes 20%, face contributes 100%
 
     @property
     def normal_estimator(self):
@@ -166,11 +153,8 @@ class TossLoraModule(TOSS):
                 "image_size": self.image_size,
                 "timesteps": self.num_timesteps,
                 # Loss config
-                "loss_type": "perceptual + mse",
-                "perceptual_weight": self.perceptual_weight,
+                "loss_type": "mse",
                 "mse_weight": self.mse_weight,
-                "mask_min_weight": self.mask_min_weight,
-                "lpips_backbone": "vgg",
             }, allow_val_change=True)
 
     def training_step(self, batch, batch_idx):
@@ -196,25 +180,6 @@ class TossLoraModule(TOSS):
 
         mse_loss = F.mse_loss(model_output, target, reduction="mean")
 
-        '''Perceptual Loss'''
-        perceptual_loss = None
-        sqrt_alphas_cumprod = self.sqrt_alphas_cumprod[t][:, None, None, None]
-        sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod[t][:, None, None, None]
-        
-        pred_x0 = (x_noisy - sqrt_one_minus_alphas_cumprod * model_output) / sqrt_alphas_cumprod
-
-        gt_x0 = x  # The clean latent we started with
-        
-        # Decode to image space for perceptual loss
-        # Use torch.no_grad for decoder to save memory (only need gradients through encoder path)
-        pred_img = self.decode_first_stage(pred_x0)  # [-1, 1] range
-        gt_img = self.decode_first_stage(gt_x0)  # [-1, 1] range
-        
-        # Compute perceptual loss (LPIPS expects [-1, 1] range)
-        # Move LPIPS to same device as images
-        self.lpips_loss = self.lpips_loss.to(pred_img.device)
-        perceptual_loss = self.lpips_loss(pred_img, gt_img).mean()
-
         '''Masked Loss'''
         # mask = None
         mask = batch.get("mask")  # Original mask [B, 1, 256, 256]
@@ -224,39 +189,18 @@ class TossLoraModule(TOSS):
             # Soft mask: mask=1 (face) -> weight=1.0, mask=0 (background) -> weight=min_weight
             soft_mask = mask * (1.0 - self.mask_min_weight) + self.mask_min_weight
 
-            # Masked perceptual loss: mask images before LPIPS so it focuses on head
-            img_mask = F.interpolate(soft_mask, size=pred_img.shape[-2:], mode="bilinear", align_corners=False)
-            masked_perceptual_loss = self.lpips_loss(pred_img * img_mask, gt_img * img_mask).mean()
-
             # Masked latent MSE, normalized by mask sum to avoid diluting head signal
             latent_mask = F.interpolate(soft_mask, size=model_output.shape[-2:], mode="area")
             masked_mse_loss = (F.mse_loss(model_output, noise, reduction="none") * latent_mask).sum() / latent_mask.sum()
 
-            loss = self.perceptual_weight * masked_perceptual_loss + self.mse_weight * masked_mse_loss
-            print(f"MASKED LOSS: perceptual={masked_perceptual_loss.item():.4f}, mse={masked_mse_loss.item():.4f}")
-        elif perceptual_loss is not None and mse_loss is not None:
-            loss = self.perceptual_weight * perceptual_loss + self.mse_weight * mse_loss
-            print(f"LOSS: perceptual={perceptual_loss.item():.4f}, mse={mse_loss.item():.4f}, total={loss.item():.4f}")
+            loss = self.mse_weight * masked_mse_loss
+            print(f"MASKED LOSS: mse={masked_mse_loss.item():.4f}")
         else:
             loss = mse_loss
 
-        ''' Geometry loss (frozen DPT-Hybrid proxy) '''
-        geom_loss = torch.tensor(0.0, device=self.device)
-        if self.geometry_loss_weight > 0 and "normal" in batch and "normal_mask" in batch:
-            pred_imgs = torch.clamp((pred_img + 1) / 2, 0, 1)
-            if pred_imgs.ndim == 4 and pred_imgs.shape[-1] == 3:
-                pred_imgs = pred_imgs.permute(0, 3, 1, 2)
-            pred_normals = self.normal_estimator(pred_imgs)
-            gt_normals = batch["normal"].to(self.device)
-            normal_mask = batch["normal_mask"].to(self.device)
-            geom_loss = _cosine_similarity_loss(pred_normals, gt_normals, normal_mask)
-            loss = loss + self.geometry_loss_weight * geom_loss
-
         wandb_log = {
             "loss": loss,
-            "perceptual_loss": perceptual_loss,
-            "mse_loss": mse_loss,
-            "geometry_loss": geom_loss,
+            "mse_loss": mse_loss
         }
 
         '''WanDB logging'''
@@ -311,19 +255,6 @@ class TossLoraModule(TOSS):
                             caption=f"Step {self.global_step} | GT normal_mask",
                         )
                     )
-                    
-                    pred_imgs_nchw = pred_img
-                    if pred_imgs_nchw.ndim == 4 and pred_imgs_nchw.shape[-1] == 3:
-                        pred_imgs_nchw = pred_imgs_nchw.permute(0, 3, 1, 2)
-                    pred_normals_dpt = self.normal_estimator(pred_imgs_nchw)
-                    vis_n = _normal_to_rgb_vis(pred_normals_dpt)
-                    normal_gt_and_preds.append(
-                        wandb.Image(
-                            vis_n,
-                            caption=f"Step {self.global_step} | Normal pred (DPT) | Pred",
-                        )
-                    )
-
                 
                 # Generate prediction for each pose
                 for yaw_deg in yaw_angles_deg:
