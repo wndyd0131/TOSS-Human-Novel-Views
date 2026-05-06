@@ -5,6 +5,13 @@ import torch.nn.functional as F
 from torch import nn
 import wandb
 import lpips
+import pytz
+from datetime import datetime
+from contextlib import nullcontext
+
+import einops
+
+from cldm.arcface_torch_wrapper import create_frozen_arcface_backbone, preprocess_arcface_input
 
 # CRITICAL FIX: Completely disable gradient checkpointing to fix LoRA gradient flow
 # The custom CheckpointFunction doesn't properly handle PEFT's dynamically added parameters
@@ -34,17 +41,36 @@ def _normal_to_rgb_vis(norm):
     return torch.clamp((norm + 1) / 2, 0, 1)
 
 class TossLoraModule(TOSS):
-    def __init__(self, lora_config_params, *args, normal_estimator_path="hf:clay3d/omnidata", geometry_loss_weight=0.0, **kwargs):
+    def __init__(
+        self,
+        lora_config_params,
+        *args,
+        normal_estimator_path="hf:clay3d/omnidata",
+        geometry_loss_weight=0.0,
+        identity_loss_weight=0.0,
+        identity_t_cut=200,
+        arcface_ckpt_path=None,
+        arcface_spatial_mode="cover_center",
+        **kwargs,
+    ):
         kwargs.pop("lora_config_params", None)  # consumed by us
         self.normal_estimator_path = kwargs.pop("normal_estimator_path", normal_estimator_path)
         self.geometry_loss_weight = kwargs.pop("geometry_loss_weight", geometry_loss_weight)
+        self.identity_loss_weight = float(kwargs.pop("identity_loss_weight", identity_loss_weight))
+        self.identity_t_cut = int(kwargs.pop("identity_t_cut", identity_t_cut))
+        self.arcface_ckpt_path = kwargs.pop("arcface_ckpt_path", arcface_ckpt_path)
+        self.arcface_spatial_mode = kwargs.pop("arcface_spatial_mode", arcface_spatial_mode)
         super().__init__(*args, **kwargs)
         self._normal_estimator = None
+        self._arcface_backbone = None
 
         global run
+        kst = pytz.timezone("Asia/Seoul")
+        now_kst = datetime.now(kst).strftime("%Y%m%d_%H%M%S")
         run = wandb.init(
             entity="wndyd0131-sungkyunkwan-university",
             project="toss-lora",
+            name=f"toss-lora_{now_kst}",
             config={
                 # LoRA config
                 "lora_r": lora_config_params.get("r", 16),
@@ -53,7 +79,12 @@ class TossLoraModule(TOSS):
                 "target_modules": lora_config_params.get("target_modules", []),
                 # Model config
                 "architecture": "TOSS + LoRA",
-                "base_model": "Stable Diffusion UNet"
+                "base_model": "Stable Diffusion UNet",
+                # Identity loss (ArcFace)
+                "identity_loss_weight": self.identity_loss_weight,
+                "identity_t_cut": self.identity_t_cut,
+                "arcface_ckpt_path": self.arcface_ckpt_path,
+                "arcface_spatial_mode": self.arcface_spatial_mode,
             },
         )
 
@@ -74,14 +105,6 @@ class TossLoraModule(TOSS):
         # CRITICAL: Disable checkpointing AGAIN after PEFT wrapping
         # PEFT changes module hierarchy, must ensure checkpointing is disabled
         self.model.diffusion_model.apply(disable_all_ckpt)
-        
-        # Verify checkpointing is disabled
-        ckpt_enabled_count = 0
-        for name, module in self.model.diffusion_model.named_modules():
-            if hasattr(module, 'checkpoint') and module.checkpoint:
-                ckpt_enabled_count += 1
-                print(f"[WARNING] Checkpointing still enabled on: {name}")
-        print(f"[INIT] Modules with checkpointing enabled: {ckpt_enabled_count}")
 
         # 3. Unfreeze PoseNet params
         pose_net_count = 0
@@ -114,16 +137,35 @@ class TossLoraModule(TOSS):
 
         self.model.diffusion_model.print_trainable_parameters()
         
-        # Verify PEFT is properly active
-        if hasattr(self.model.diffusion_model, 'peft_config'):
-            print(f"[INIT] PEFT config active: {self.model.diffusion_model.peft_config}")
-        else:
-            print("[WARNING] No peft_config found - PEFT may not be properly initialized!")
-        
         # Loss weights for hybrid loss
         # self.perceptual_weight = 0.0  # Weight for perceptual loss
         self.mse_weight = 1.0  # Small MSE component for stability
-        # self.mask_min_weight = 0.2  # Soft mask: background contributes 20%, face contributes 100%
+        self.mask_min_weight = 0.2  # Soft mask: background contributes 20%, face contributes 100%
+
+    def _decode_first_stage_train(self, z):
+        """Like ``decode_first_stage`` but without grad-disabled decorator so x0 gradients reach RGB."""
+        z = (1.0 / self.scale_factor) * z
+        return self.first_stage_model.decode(z)
+
+    def _gt_rgb_01_from_batch(self, batch):
+        """Target view RGB in [0, 1], CHW — same layout as ``TOSS.get_input`` before ``*2-1`` encode."""
+        x = batch[self.first_stage_key]
+        x = x.to(self.device)
+        if x.ndim == 4 and x.shape[-1] == 3:
+            x = einops.rearrange(x, "b h w c -> b c h w")
+        return x.clamp(0.0, 1.0)
+
+    def _ensure_arcface_backbone(self):
+        if self._arcface_backbone is None:
+            if not self.arcface_ckpt_path:
+                raise ValueError("identity_loss_weight > 0 requires arcface_ckpt_path to a backbone .pth")
+            self._arcface_backbone = create_frozen_arcface_backbone(self.arcface_ckpt_path).to(self.device)
+        return self._arcface_backbone
+
+    def _identity_autocast_ctx(self):
+        if self.device.type == "cuda":
+            return torch.cuda.amp.autocast(enabled=False)
+        return nullcontext()
 
     @property
     def normal_estimator(self):
@@ -159,6 +201,8 @@ class TossLoraModule(TOSS):
                 # Loss config
                 "loss_type": "mse",
                 "mse_weight": self.mse_weight,
+                "identity_loss_weight": self.identity_loss_weight,
+                "identity_t_cut": self.identity_t_cut,
             }, allow_val_change=True)
 
     def training_step(self, batch, batch_idx):
@@ -180,32 +224,56 @@ class TossLoraModule(TOSS):
         '''Forward'''
         model_output = self.apply_model(x_noisy, t, cond)
 
-        target = noise
-
-        mse_loss = F.mse_loss(model_output, target, reduction="mean")
+        mse_loss = F.mse_loss(model_output, noise, reduction="mean")
 
         '''Masked Loss'''
         # mask = None
         mask = batch.get("mask")  # Original mask [B, 1, 256, 256]
 
-        if mask is not None:
-            mask = mask.to(self.device)
-            # Soft mask: mask=1 (face) -> weight=1.0, mask=0 (background) -> weight=min_weight
-            soft_mask = mask * (1.0 - self.mask_min_weight) + self.mask_min_weight
+        # if mask is not None:
+        #     mask = mask.to(self.device)
+        #     # Soft mask: mask=1 (face) -> weight=1.0, mask=0 (background) -> weight=min_weight
+        #     soft_mask = mask * (1.0 - self.mask_min_weight) + self.mask_min_weight
 
-            # Masked latent MSE, normalized by mask sum to avoid diluting head signal
-            latent_mask = F.interpolate(soft_mask, size=model_output.shape[-2:], mode="area")
-            masked_mse_loss = (F.mse_loss(model_output, noise, reduction="none") * latent_mask).sum() / latent_mask.sum()
+        #     # Masked latent MSE, normalized by mask sum to avoid diluting head signal
+        #     latent_mask = F.interpolate(soft_mask, size=model_output.shape[-2:], mode="area")
+        #     masked_mse_loss = (F.mse_loss(model_output, noise, reduction="none") * latent_mask).sum() / latent_mask.sum()
 
-            loss = self.mse_weight * masked_mse_loss
-            print(f"MASKED LOSS: mse={masked_mse_loss.item():.4f}")
-        else:
-            loss = mse_loss
+        #     loss = self.mse_weight * masked_mse_loss
+        #     print(f"MASKED LOSS: mse={masked_mse_loss.item():.4f}")
+        # else:
+        loss = mse_loss
+
+        identity_loss = None
+        if self.identity_loss_weight > 0.0:
+            sel = t < self.identity_t_cut # t가 높을 경우 너무 noisy하기 때문에 예측이 불안정하여, timestep가 높은 경우에는 비교하지 않음
+            if torch.any(sel):
+                x0_pred = self.predict_start_from_noise(x_noisy[sel], t[sel], model_output[sel]) # clean latent
+                pred_img = self._decode_first_stage_train(x0_pred) # latent to image, gradients reach RGB
+                pred_rgb = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0) # [-1, 1] to [0, 1]
+                gt_rgb = self._gt_rgb_01_from_batch(batch)[sel] # rgb to [0, 1]
+
+                backbone = self._ensure_arcface_backbone()
+                with self._identity_autocast_ctx():
+                    pred_arc = preprocess_arcface_input(
+                        pred_rgb.float(),
+                        spatial_mode=self.arcface_spatial_mode,
+                    )
+                    gt_arc = preprocess_arcface_input(
+                        gt_rgb.float().detach(),
+                        spatial_mode=self.arcface_spatial_mode,
+                    )
+                    emb_pred = F.normalize(backbone(pred_arc), dim=-1)
+                    emb_gt = F.normalize(backbone(gt_arc), dim=-1).detach()
+                identity_loss = (1.0 - (emb_pred * emb_gt).sum(dim=-1)).mean() # cosine similarity loss
+                loss = loss + self.identity_loss_weight * identity_loss
 
         wandb_log = {
             "loss": loss,
             "mse_loss": mse_loss
         }
+        if identity_loss is not None:
+            wandb_log["identity_loss"] = identity_loss
 
         '''WanDB logging'''
         if self.global_step % 50 == 0:

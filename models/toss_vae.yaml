@@ -105,6 +105,12 @@ model:
     finetune: True
     ucg_img: 0.05
 
+    # Identity loss (ArcFace)
+    identity_loss_weight: 0.05
+    identity_t_cut: 200 # timestep threshold
+    arcface_ckpt_path: "ckpt/ms1mv3_arcface_r100_fp16.pth"
+    arcface_spatial_mode: "cover_center" # RGB 이미지를 112×112로 맞추는 방식
+
     # Geometry loss (frozen DPT-Hybrid normal estimator)
     normal_estimator_path: "hf:clay3d/omnidata"
     geometry_loss_weight: 0.1
