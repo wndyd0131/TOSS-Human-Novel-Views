@@ -176,6 +176,7 @@ class TossLoraModule(TOSS):
             if not self.arcface_ckpt_path:
                 raise ValueError("identity_loss_weight > 0 requires arcface_ckpt_path to a backbone .pth")
             self._arcface_backbone = create_frozen_arcface_backbone(self.arcface_ckpt_path).to(self.device)
+        self._arcface_backbone.eval()
         return self._arcface_backbone
 
     def _ensure_dists(self):
@@ -186,6 +187,7 @@ class TossLoraModule(TOSS):
                 p.requires_grad_(False)
             m.eval()
             self._dists_model = m
+        self._dists_model.eval()
         return self._dists_model
 
     def _identity_autocast_ctx(self):
