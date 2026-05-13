@@ -40,6 +40,14 @@ def _normal_to_rgb_vis(norm):
         norm = norm[0]
     return torch.clamp((norm + 1) / 2, 0, 1)
 
+def _grayscale_sobel_3ch(rgb_01):
+    """rgb_01: [B, 3, H, W] in [0, 1]. Returns 3-channel Sobel magnitude in [0, 1]."""
+    from kornia.color import rgb_to_grayscale
+    from kornia.filters import sobel
+    gray = rgb_to_grayscale(rgb_01)         # [B, 1, H, W]
+    edge = sobel(gray)                      # [B, 1, H, W] L2 gradient magnitude
+    return edge.expand(-1, 3, -1, -1).clamp(0.0, 1.0)
+
 class TossLoraModule(TOSS):
     def __init__(
         self,
@@ -51,6 +59,8 @@ class TossLoraModule(TOSS):
         identity_t_cut=200,
         arcface_ckpt_path=None,
         arcface_spatial_mode="cover_center",
+        dists_loss_weight=0.0,
+        dists_t_cut=200,
         **kwargs,
     ):
         kwargs.pop("lora_config_params", None)  # consumed by us
@@ -60,9 +70,12 @@ class TossLoraModule(TOSS):
         self.identity_t_cut = int(kwargs.pop("identity_t_cut", identity_t_cut))
         self.arcface_ckpt_path = kwargs.pop("arcface_ckpt_path", arcface_ckpt_path)
         self.arcface_spatial_mode = kwargs.pop("arcface_spatial_mode", arcface_spatial_mode)
+        self.dists_loss_weight = float(kwargs.pop("dists_loss_weight", dists_loss_weight))
+        self.dists_t_cut = int(kwargs.pop("dists_t_cut", dists_t_cut))
         super().__init__(*args, **kwargs)
         self._normal_estimator = None
         self._arcface_backbone = None
+        self._dists_model = None
 
         global run
         kst = pytz.timezone("Asia/Seoul")
@@ -85,6 +98,9 @@ class TossLoraModule(TOSS):
                 "identity_t_cut": self.identity_t_cut,
                 "arcface_ckpt_path": self.arcface_ckpt_path,
                 "arcface_spatial_mode": self.arcface_spatial_mode,
+                # DISTS perceptual loss (image + Sobel)
+                "dists_loss_weight": self.dists_loss_weight,
+                "dists_t_cut": self.dists_t_cut,
             },
         )
 
@@ -162,6 +178,16 @@ class TossLoraModule(TOSS):
             self._arcface_backbone = create_frozen_arcface_backbone(self.arcface_ckpt_path).to(self.device)
         return self._arcface_backbone
 
+    def _ensure_dists(self):
+        if self._dists_model is None:
+            from DISTS_pytorch import DISTS
+            m = DISTS().to(self.device)
+            for p in m.parameters():
+                p.requires_grad_(False)
+            m.eval()
+            self._dists_model = m
+        return self._dists_model
+
     def _identity_autocast_ctx(self):
         if self.device.type == "cuda":
             return torch.cuda.amp.autocast(enabled=False)
@@ -203,6 +229,8 @@ class TossLoraModule(TOSS):
                 "mse_weight": self.mse_weight,
                 "identity_loss_weight": self.identity_loss_weight,
                 "identity_t_cut": self.identity_t_cut,
+                "dists_loss_weight": self.dists_loss_weight,
+                "dists_t_cut": self.dists_t_cut,
             }, allow_val_change=True)
 
     def training_step(self, batch, batch_idx):
@@ -268,12 +296,37 @@ class TossLoraModule(TOSS):
                 identity_loss = (1.0 - (emb_pred * emb_gt).sum(dim=-1)).mean() # cosine similarity loss
                 loss = loss + self.identity_loss_weight * identity_loss
 
+        dists_loss = None
+        d_img = None
+        d_sobel = None
+        if self.dists_loss_weight > 0.0:
+            sel = t < self.dists_t_cut
+            if torch.any(sel):
+                x0_pred = self.predict_start_from_noise(x_noisy[sel], t[sel], model_output[sel])
+                pred_img = self._decode_first_stage_train(x0_pred)
+                pred_rgb = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0).float()
+                gt_rgb = self._gt_rgb_01_from_batch(batch)[sel].float().detach()
+
+                dists_model = self._ensure_dists()
+                d_img = dists_model(pred_rgb, gt_rgb, require_grad=True, batch_average=True)
+
+                pred_sobel = _grayscale_sobel_3ch(pred_rgb)
+                gt_sobel = _grayscale_sobel_3ch(gt_rgb).detach()
+                d_sobel = dists_model(pred_sobel, gt_sobel, require_grad=True, batch_average=True)
+
+                dists_loss = d_img + d_sobel
+                loss = loss + self.dists_loss_weight * dists_loss
+
         wandb_log = {
             "loss": loss,
             "mse_loss": mse_loss
         }
         if identity_loss is not None:
             wandb_log["identity_loss"] = identity_loss
+        if dists_loss is not None:
+            wandb_log["dists_loss"] = dists_loss
+            wandb_log["dists_loss_img"] = d_img
+            wandb_log["dists_loss_sobel"] = d_sobel
 
         '''WanDB logging'''
         if self.global_step % 50 == 0:

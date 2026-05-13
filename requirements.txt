@@ -25,3 +25,4 @@ peft==0.17.1
 setuptools==81.0.0
 lpips==0.1.4
 wandb==0.24.1
+DISTS-pytorch==0.1

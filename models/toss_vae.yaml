@@ -115,6 +115,10 @@ model:
     normal_estimator_path: "hf:clay3d/omnidata"
     geometry_loss_weight: 0.1
 
+    # DISTS perceptual loss (image + Sobel)
+    dists_loss_weight: 0.05
+    dists_t_cut: 200
+
     scheduler_config: # 10000 warmup steps
       target: ldm.lr_scheduler.LambdaLinearScheduler
       params:
