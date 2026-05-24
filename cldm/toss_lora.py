@@ -275,49 +275,66 @@ class TossLoraModule(TOSS):
         loss = mse_loss
 
         identity_loss = None
-        if self.identity_loss_weight > 0.0:
-            sel = t < self.identity_t_cut # t가 높을 경우 너무 noisy하기 때문에 예측이 불안정하여, timestep가 높은 경우에는 비교하지 않음
+        dists_loss = None
+        d_img = None
+        d_sobel = None
+
+        need_identity = self.identity_loss_weight > 0.0
+        need_dists    = self.dists_loss_weight    > 0.0
+
+        # Decode pred_rgb / gt_rgb ONCE on the union mask so identity and DISTS
+        # share a single VAE-decoder forward + backward graph (memory win:
+        # avoids running the decoder twice). t가 높을 경우 너무 noisy하기 때문에
+        # 예측이 불안정하여, timestep가 높은 경우에는 비교하지 않음.
+        if need_identity or need_dists:
+            union_cut = max(
+                self.identity_t_cut if need_identity else 0,
+                self.dists_t_cut    if need_dists    else 0,
+            )
+            sel = t < union_cut
             if torch.any(sel):
                 x0_pred = self.predict_start_from_noise(x_noisy[sel], t[sel], model_output[sel]) # clean latent
                 pred_img = self._decode_first_stage_train(x0_pred) # latent to image, gradients reach RGB
                 pred_rgb = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0) # [-1, 1] to [0, 1]
                 gt_rgb = self._gt_rgb_01_from_batch(batch)[sel] # rgb to [0, 1]
+                t_sel = t[sel]
 
-                backbone = self._ensure_arcface_backbone()
-                with self._identity_autocast_ctx():
-                    pred_arc = preprocess_arcface_input(
-                        pred_rgb.float(),
-                        spatial_mode=self.arcface_spatial_mode,
-                    )
-                    gt_arc = preprocess_arcface_input(
-                        gt_rgb.float().detach(),
-                        spatial_mode=self.arcface_spatial_mode,
-                    )
-                    emb_pred = F.normalize(backbone(pred_arc), dim=-1)
-                    emb_gt = F.normalize(backbone(gt_arc), dim=-1).detach()
-                identity_loss = (1.0 - (emb_pred * emb_gt).sum(dim=-1)).mean() # cosine similarity loss
-                loss = loss + self.identity_loss_weight * identity_loss
+                if need_identity:
+                    sub = t_sel < self.identity_t_cut
+                    if torch.any(sub):
+                        pred_rgb_id = pred_rgb[sub]
+                        gt_rgb_id   = gt_rgb[sub]
 
-        dists_loss = None
-        d_img = None
-        d_sobel = None
-        if self.dists_loss_weight > 0.0:
-            sel = t < self.dists_t_cut
-            if torch.any(sel):
-                x0_pred = self.predict_start_from_noise(x_noisy[sel], t[sel], model_output[sel])
-                pred_img = self._decode_first_stage_train(x0_pred)
-                pred_rgb = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0).float()
-                gt_rgb = self._gt_rgb_01_from_batch(batch)[sel].float().detach()
+                        backbone = self._ensure_arcface_backbone()
+                        with self._identity_autocast_ctx():
+                            pred_arc = preprocess_arcface_input(
+                                pred_rgb_id.float(),
+                                spatial_mode=self.arcface_spatial_mode,
+                            )
+                            gt_arc = preprocess_arcface_input(
+                                gt_rgb_id.float().detach(),
+                                spatial_mode=self.arcface_spatial_mode,
+                            )
+                            emb_pred = F.normalize(backbone(pred_arc), dim=-1)
+                            emb_gt = F.normalize(backbone(gt_arc), dim=-1).detach()
+                        identity_loss = (1.0 - (emb_pred * emb_gt).sum(dim=-1)).mean() # cosine similarity loss
+                        loss = loss + self.identity_loss_weight * identity_loss
 
-                dists_model = self._ensure_dists()
-                d_img = dists_model(pred_rgb, gt_rgb, require_grad=True, batch_average=True)
+                if need_dists:
+                    sub = t_sel < self.dists_t_cut
+                    if torch.any(sub):
+                        pred_rgb_d = pred_rgb[sub].float()
+                        gt_rgb_d   = gt_rgb[sub].float().detach()
 
-                pred_sobel = _grayscale_sobel_3ch(pred_rgb)
-                gt_sobel = _grayscale_sobel_3ch(gt_rgb).detach()
-                d_sobel = dists_model(pred_sobel, gt_sobel, require_grad=True, batch_average=True)
+                        dists_model = self._ensure_dists()
+                        d_img = dists_model(pred_rgb_d, gt_rgb_d, require_grad=True, batch_average=True)
 
-                dists_loss = d_img + d_sobel
-                loss = loss + self.dists_loss_weight * dists_loss
+                        pred_sobel = _grayscale_sobel_3ch(pred_rgb_d)
+                        gt_sobel   = _grayscale_sobel_3ch(gt_rgb_d).detach()
+                        d_sobel = dists_model(pred_sobel, gt_sobel, require_grad=True, batch_average=True)
+
+                        dists_loss = d_img + d_sobel
+                        loss = loss + self.dists_loss_weight * dists_loss
 
         wandb_log = {
             "loss": loss,
