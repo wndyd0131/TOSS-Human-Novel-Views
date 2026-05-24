@@ -55,6 +55,7 @@ class TossLoraModule(TOSS):
         *args,
         normal_estimator_path="hf:clay3d/omnidata",
         geometry_loss_weight=0.0,
+        geometry_t_cut=200,
         identity_loss_weight=0.0,
         identity_t_cut=200,
         arcface_ckpt_path=None,
@@ -66,6 +67,7 @@ class TossLoraModule(TOSS):
         kwargs.pop("lora_config_params", None)  # consumed by us
         self.normal_estimator_path = kwargs.pop("normal_estimator_path", normal_estimator_path)
         self.geometry_loss_weight = kwargs.pop("geometry_loss_weight", geometry_loss_weight)
+        self.geometry_t_cut = int(kwargs.pop("geometry_t_cut", geometry_t_cut))
         self.identity_loss_weight = float(kwargs.pop("identity_loss_weight", identity_loss_weight))
         self.identity_t_cut = int(kwargs.pop("identity_t_cut", identity_t_cut))
         self.arcface_ckpt_path = kwargs.pop("arcface_ckpt_path", arcface_ckpt_path)
@@ -101,6 +103,8 @@ class TossLoraModule(TOSS):
                 # DISTS perceptual loss (image + Sobel)
                 "dists_loss_weight": self.dists_loss_weight,
                 "dists_t_cut": self.dists_t_cut,
+                "geometry_loss_weight": self.geometry_loss_weight,
+                "geometry_t_cut": self.geometry_t_cut,
             },
         )
 
@@ -233,6 +237,8 @@ class TossLoraModule(TOSS):
                 "identity_t_cut": self.identity_t_cut,
                 "dists_loss_weight": self.dists_loss_weight,
                 "dists_t_cut": self.dists_t_cut,
+                "geometry_loss_weight": self.geometry_loss_weight,
+                "geometry_t_cut": self.geometry_t_cut,
             }, allow_val_change=True)
 
     def training_step(self, batch, batch_idx):
@@ -276,20 +282,27 @@ class TossLoraModule(TOSS):
 
         identity_loss = None
         dists_loss = None
+        geom_loss = None
         d_img = None
         d_sobel = None
 
         need_identity = self.identity_loss_weight > 0.0
         need_dists    = self.dists_loss_weight    > 0.0
+        need_geometry = (
+            self.geometry_loss_weight > 0.0
+            and "normal" in batch
+            and "normal_mask" in batch
+        )
 
-        # Decode pred_rgb / gt_rgb ONCE on the union mask so identity and DISTS
-        # share a single VAE-decoder forward + backward graph (memory win:
-        # avoids running the decoder twice). t가 높을 경우 너무 noisy하기 때문에
+        # Decode pred_rgb / gt_rgb ONCE on the union mask so identity, DISTS,
+        # and geometry share a single VAE-decoder forward + backward graph
+        # (memory win: avoids running the decoder twice). t가 높을 경우 너무 noisy하기 때문에
         # 예측이 불안정하여, timestep가 높은 경우에는 비교하지 않음.
-        if need_identity or need_dists:
+        if need_identity or need_dists or need_geometry:
             union_cut = max(
                 self.identity_t_cut if need_identity else 0,
                 self.dists_t_cut    if need_dists    else 0,
+                self.geometry_t_cut if need_geometry else 0,
             )
             sel = t < union_cut
             if torch.any(sel):
@@ -336,6 +349,43 @@ class TossLoraModule(TOSS):
                         dists_loss = d_img + d_sobel
                         loss = loss + self.dists_loss_weight * dists_loss
 
+                if need_geometry:
+                    sub = t_sel < self.geometry_t_cut
+                    if torch.any(sub):
+                        pred_rgb_g = pred_rgb[sub]
+                        pred_normals = self.normal_estimator(pred_rgb_g)
+
+                        gt_normals = batch["normal"].to(self.device)
+                        if gt_normals.ndim == 4 and gt_normals.shape[-1] == 3:
+                            gt_normals = gt_normals.permute(0, 3, 1, 2)
+                        gt_normals = gt_normals[sel][sub]
+                        if gt_normals.shape[-2:] != pred_normals.shape[-2:]:
+                            gt_normals = F.interpolate(
+                                gt_normals,
+                                size=pred_normals.shape[-2:],
+                                mode="bilinear",
+                                align_corners=False,
+                            )
+                        gt_normals = gt_normals / gt_normals.norm(dim=1, keepdim=True).clamp(min=1e-8)
+
+                        normal_mask = batch["normal_mask"].to(self.device).float()
+                        if normal_mask.ndim == 3:
+                            normal_mask = normal_mask.unsqueeze(1)
+                        normal_mask = normal_mask[sel][sub]
+                        if normal_mask.shape[-2:] != pred_normals.shape[-2:]:
+                            normal_mask = F.interpolate(
+                                normal_mask,
+                                size=pred_normals.shape[-2:],
+                                mode="area",
+                            )
+
+                        geom_loss = _cosine_similarity_loss(
+                            pred_normals,
+                            gt_normals.detach(),
+                            normal_mask.detach(),
+                        )
+                        loss = loss + self.geometry_loss_weight * geom_loss
+
         wandb_log = {
             "loss": loss,
             "mse_loss": mse_loss
@@ -346,6 +396,8 @@ class TossLoraModule(TOSS):
             wandb_log["dists_loss"] = dists_loss
             wandb_log["dists_loss_img"] = d_img
             wandb_log["dists_loss_sobel"] = d_sobel
+        if geom_loss is not None:
+            wandb_log["geometry_loss"] = geom_loss
 
         '''WanDB logging'''
         if self.global_step % 50 == 0:
