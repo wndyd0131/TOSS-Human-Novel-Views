@@ -354,7 +354,8 @@ class TossLoraModule(TOSS):
                     if torch.any(sub):
                         pred_rgb_g = pred_rgb[sub]
                         pred_normals = self.normal_estimator(pred_rgb_g)
-
+                        pred_normals = pred_normals / pred_normals.norm(dim=1, keepdim=True).clamp(min=1e-8)
+                        
                         gt_normals = batch["normal"].to(self.device)
                         if gt_normals.ndim == 4 and gt_normals.shape[-1] == 3:
                             gt_normals = gt_normals.permute(0, 3, 1, 2)
@@ -367,6 +368,8 @@ class TossLoraModule(TOSS):
                                 align_corners=False,
                             )
                         gt_normals = gt_normals / gt_normals.norm(dim=1, keepdim=True).clamp(min=1e-8)
+                        gt_normals_xflip = gt_normals.clone()
+                        gt_normals_xflip[:, 0:1] *= -1
 
                         normal_mask = batch["normal_mask"].to(self.device).float()
                         if normal_mask.ndim == 3:
@@ -381,9 +384,46 @@ class TossLoraModule(TOSS):
 
                         geom_loss = _cosine_similarity_loss(
                             pred_normals,
-                            gt_normals.detach(),
+                            gt_normals_xflip.detach(),
                             normal_mask.detach(),
                         )
+
+                        with torch.no_grad():
+                            self._wandb_pred_normals = pred_normals[:1].detach()
+                            self._wandb_gt_normals_xflip = gt_normals_xflip[:1].detach()
+                            self._wandb_normal_mask = normal_mask[:1].detach()
+                            self._wandb_pred_normals_step = int(self.global_step)
+
+                        # gt_rgb = batch["jpg"][sel][sub]
+
+                        # # DEBUG
+                        # with torch.no_grad():
+                        #     dpt_on_gt = self.normal_estimator(gt_rgb)
+                        #     dpt_on_gt = dpt_on_gt / dpt_on_gt.norm(dim=1, keepdim=True).clamp(min=1e-8)
+
+                        #     loss_gt = _cosine_similarity_loss(
+                        #         dpt_on_gt,
+                        #         gt_normals_xflip.detach(),
+                        #         normal_mask.detach(),
+                        #     )
+                        #     print("DPT(GT RGB) vs Pixel3DMM normal:", loss_gt.item())
+
+                        # DEBUG
+                        print("geom_loss", geom_loss.item())
+                        print("mask mean", normal_mask.mean().item())
+                        print("pred normal range", pred_normals.min().item(), pred_normals.max().item())
+                        print("gt normal range", gt_normals.min().item(), gt_normals.max().item())
+                        print("pred normal norm", pred_normals.norm(dim=1).mean())
+                        print("gt normal norm", gt_normals.norm(dim=1).mean())
+
+                        base = _cosine_similarity_loss(pred_normals, gt_normals, normal_mask)
+
+                        flip_x = _cosine_similarity_loss(pred_normals * torch.tensor([-1,1,1], device=pred_normals.device)[None,:,None,None], gt_normals, normal_mask)
+                        flip_y = _cosine_similarity_loss(pred_normals * torch.tensor([1,-1,1], device=pred_normals.device)[None,:,None,None], gt_normals, normal_mask)
+                        flip_z = _cosine_similarity_loss(pred_normals * torch.tensor([1,1,-1], device=pred_normals.device)[None,:,None,None], gt_normals, normal_mask)
+                        flip_yz = _cosine_similarity_loss(pred_normals * torch.tensor([1,-1,-1], device=pred_normals.device)[None,:,None,None], gt_normals, normal_mask)
+
+                        print(base, flip_x, flip_y, flip_z, flip_yz)
                         loss = loss + self.geometry_loss_weight * geom_loss
 
         wandb_log = {
@@ -438,6 +478,36 @@ class TossLoraModule(TOSS):
                             caption=f"Step {self.global_step} | GT normal (target view)",
                         )
                     )
+
+                    if (
+                        self.geometry_loss_weight > 0.0
+                        and getattr(self, "_wandb_pred_normals_step", -1) == int(self.global_step)
+                        and getattr(self, "_wandb_pred_normals", None) is not None
+                    ):
+                        pred_normals_vis = self._wandb_pred_normals
+                        gt_xflip_vis = getattr(self, "_wandb_gt_normals_xflip", None)
+                        nm_pred = self._wandb_normal_mask
+                        if nm_pred.ndim == 3:
+                            nm_pred = nm_pred.unsqueeze(1)
+
+                        m_rgb = nm_pred[0] if nm_pred.ndim == 4 else nm_pred
+
+                        vis_pred = _normal_to_rgb_vis(pred_normals_vis * nm_pred) * m_rgb
+                        normal_gt_and_preds.append(
+                            wandb.Image(
+                                vis_pred,
+                                caption=f"Step {self.global_step} | Pred normal * mask",
+                            )
+                        )
+
+                        if gt_xflip_vis is not None:
+                            vis_gt_xflip = _normal_to_rgb_vis(gt_xflip_vis * nm_pred) * m_rgb
+                            normal_gt_and_preds.append(
+                                wandb.Image(
+                                    vis_gt_xflip,
+                                    caption=f"Step {self.global_step} | GT normal x-flip * mask (loss target)",
+                                )
+                            )
 
                     nm = batch["normal_mask"][:1].to(self.device).float()
                     if nm.ndim == 4:
