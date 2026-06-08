@@ -48,6 +48,48 @@ def _grayscale_sobel_3ch(rgb_01):
     edge = sobel(gray)                      # [B, 1, H, W] L2 gradient magnitude
     return edge.expand(-1, 3, -1, -1).clamp(0.0, 1.0)
 
+
+class DepthHead(nn.Module):
+    """Predicts a disparity map from the denoised latent ``x0_pred``.
+
+    Input:  latent [B, in_ch, 32, 32] (in_ch = VAE latent channels, 4 for SD).
+    Output: disparity [B, 1, 256, 256], non-negative (softplus).
+
+    Three x2 upsample+conv stages take 32 -> 64 -> 128 -> 256.
+    """
+
+    def __init__(self, in_ch=4, base_ch=128):
+        super().__init__()
+
+        def block(c_in, c_out):
+            return nn.Sequential(
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                nn.Conv2d(c_in, c_out, kernel_size=3, padding=1),
+                nn.GroupNorm(8, c_out),
+                nn.SiLU(),
+                nn.Conv2d(c_out, c_out, kernel_size=3, padding=1),
+                nn.GroupNorm(8, c_out),
+                nn.SiLU(),
+            )
+
+        self.in_conv = nn.Sequential(
+            nn.Conv2d(in_ch, base_ch, kernel_size=3, padding=1),
+            nn.GroupNorm(8, base_ch),
+            nn.SiLU(),
+        )
+        self.up1 = block(base_ch, base_ch)          # 32 -> 64
+        self.up2 = block(base_ch, base_ch // 2)     # 64 -> 128
+        self.up3 = block(base_ch // 2, base_ch // 4)  # 128 -> 256
+        self.out_conv = nn.Conv2d(base_ch // 4, 1, kernel_size=3, padding=1)
+
+    def forward(self, z):
+        x = self.in_conv(z)
+        x = self.up1(x)
+        x = self.up2(x)
+        x = self.up3(x)
+        x = self.out_conv(x)
+        return F.softplus(x)  # disparity >= 0
+
 class TossLoraModule(TOSS):
     def __init__(
         self,
@@ -62,6 +104,8 @@ class TossLoraModule(TOSS):
         arcface_spatial_mode="cover_center",
         dists_loss_weight=0.0,
         dists_t_cut=200,
+        depth_loss_weight=0.0,
+        depth_t_cut=200,
         **kwargs,
     ):
         kwargs.pop("lora_config_params", None)  # consumed by us
@@ -74,6 +118,8 @@ class TossLoraModule(TOSS):
         self.arcface_spatial_mode = kwargs.pop("arcface_spatial_mode", arcface_spatial_mode)
         self.dists_loss_weight = float(kwargs.pop("dists_loss_weight", dists_loss_weight))
         self.dists_t_cut = int(kwargs.pop("dists_t_cut", dists_t_cut))
+        self.depth_loss_weight = float(kwargs.pop("depth_loss_weight", depth_loss_weight))
+        self.depth_t_cut = int(kwargs.pop("depth_t_cut", depth_t_cut))
         super().__init__(*args, **kwargs)
         self._normal_estimator = None
         self._arcface_backbone = None
@@ -105,6 +151,9 @@ class TossLoraModule(TOSS):
                 "dists_t_cut": self.dists_t_cut,
                 "geometry_loss_weight": self.geometry_loss_weight,
                 "geometry_t_cut": self.geometry_t_cut,
+                # Depth head (disparity) loss
+                "depth_loss_weight": self.depth_loss_weight,
+                "depth_t_cut": self.depth_t_cut,
             },
         )
 
@@ -161,6 +210,13 @@ class TossLoraModule(TOSS):
         # self.perceptual_weight = 0.0  # Weight for perceptual loss
         self.mse_weight = 1.0  # Small MSE component for stability
         self.mask_min_weight = 0.2  # Soft mask: background contributes 20%, face contributes 100%
+
+        # Depth head: predicts target-view disparity from the denoised latent x0_pred.
+        # Created AFTER self.requires_grad_(False) so its params stay trainable.
+        self.depth_head = DepthHead(in_ch=self.channels)
+        for p in self.depth_head.parameters():
+            p.requires_grad = True
+        print(f"[INIT] Created depth_head (in_ch={self.channels}), trainable")
 
     def _decode_first_stage_train(self, z):
         """Like ``decode_first_stage`` but without grad-disabled decorator so x0 gradients reach RGB."""
@@ -239,6 +295,8 @@ class TossLoraModule(TOSS):
                 "dists_t_cut": self.dists_t_cut,
                 "geometry_loss_weight": self.geometry_loss_weight,
                 "geometry_t_cut": self.geometry_t_cut,
+                "depth_loss_weight": self.depth_loss_weight,
+                "depth_t_cut": self.depth_t_cut,
             }, allow_val_change=True)
 
     def training_step(self, batch, batch_idx):
@@ -283,6 +341,7 @@ class TossLoraModule(TOSS):
         identity_loss = None
         dists_loss = None
         geom_loss = None
+        depth_loss = None
         d_img = None
         d_sobel = None
 
@@ -293,16 +352,22 @@ class TossLoraModule(TOSS):
             and "normal" in batch
             and "normal_mask" in batch
         )
+        need_depth = (
+            self.depth_loss_weight > 0.0
+            and "depth" in batch
+            and "depth_mask" in batch
+        )
 
         # Decode pred_rgb / gt_rgb ONCE on the union mask so identity, DISTS,
         # and geometry share a single VAE-decoder forward + backward graph
         # (memory win: avoids running the decoder twice). t가 높을 경우 너무 noisy하기 때문에
         # 예측이 불안정하여, timestep가 높은 경우에는 비교하지 않음.
-        if need_identity or need_dists or need_geometry:
+        if need_identity or need_dists or need_geometry or need_depth:
             union_cut = max(
                 self.identity_t_cut if need_identity else 0,
                 self.dists_t_cut    if need_dists    else 0,
                 self.geometry_t_cut if need_geometry else 0,
+                self.depth_t_cut    if need_depth    else 0,
             )
             sel = t < union_cut
             if torch.any(sel):
@@ -426,6 +491,58 @@ class TossLoraModule(TOSS):
                         print(base, flip_x, flip_y, flip_z, flip_yz)
                         loss = loss + self.geometry_loss_weight * geom_loss
 
+                if need_depth:
+                    sub = t_sel < self.depth_t_cut
+                    if torch.any(sub):
+                        eps = 1e-6
+                        # Predict target-view disparity from the denoised latent.
+                        pred_disp = self.depth_head(x0_pred[sub])  # [b, 1, 256, 256]
+
+                        gt_depth = batch["depth"].to(self.device).float()
+                        if gt_depth.ndim == 3:
+                            gt_depth = gt_depth.unsqueeze(1)
+                        gt_depth = gt_depth[sel][sub]
+
+                        depth_mask = batch["depth_mask"].to(self.device).float()
+                        if depth_mask.ndim == 3:
+                            depth_mask = depth_mask.unsqueeze(1)
+                        depth_mask = depth_mask[sel][sub]
+
+                        # Intersect depth-valid mask with the rembg foreground mask.
+                        fg_mask = batch.get("mask")
+                        if fg_mask is not None:
+                            fg_mask = fg_mask.to(self.device).float()
+                            if fg_mask.ndim == 3:
+                                fg_mask = fg_mask.unsqueeze(1)
+                            fg_mask = (fg_mask[sel][sub] > 0.5).float()
+                            d_mask = depth_mask * fg_mask
+                        else:
+                            d_mask = depth_mask
+
+                        # Match spatial sizes to the predicted disparity.
+                        if gt_depth.shape[-2:] != pred_disp.shape[-2:]:
+                            gt_depth = F.interpolate(
+                                gt_depth, size=pred_disp.shape[-2:],
+                                mode="bilinear", align_corners=False,
+                            )
+                        if d_mask.shape[-2:] != pred_disp.shape[-2:]:
+                            d_mask = F.interpolate(
+                                d_mask, size=pred_disp.shape[-2:], mode="area",
+                            )
+
+                        gt_disp = d_mask / gt_depth.clamp(min=eps)
+
+                        depth_loss = (d_mask * (pred_disp - gt_disp).abs()).sum() / (d_mask.sum() + eps)
+                        loss = loss + self.depth_loss_weight * depth_loss
+
+                        with torch.no_grad():
+                            self._wandb_pred_disp = pred_disp[:1].detach()
+                            self._wandb_gt_disp = gt_disp[:1].detach()
+                            self._wandb_depth_mask = d_mask[:1].detach()
+                            self._wandb_depth_step = int(self.global_step)
+
+                        print("depth_loss", depth_loss.item())
+
         wandb_log = {
             "loss": loss,
             "mse_loss": mse_loss
@@ -438,6 +555,8 @@ class TossLoraModule(TOSS):
             wandb_log["dists_loss_sobel"] = d_sobel
         if geom_loss is not None:
             wandb_log["geometry_loss"] = geom_loss
+        if depth_loss is not None:
+            wandb_log["depth_loss"] = depth_loss
 
         '''WanDB logging'''
         if self.global_step % 50 == 0:
@@ -560,6 +679,41 @@ class TossLoraModule(TOSS):
                 wandb_log["multiview_predictions"] = wandb_images
                 if normal_gt_and_preds:
                     wandb_log["normal_gt_and_preds"] = normal_gt_and_preds
+
+                if (
+                    self.depth_loss_weight > 0.0
+                    and getattr(self, "_wandb_depth_step", -1) == int(self.global_step)
+                    and getattr(self, "_wandb_pred_disp", None) is not None
+                ):
+                    def _disp_to_rgb_vis(disp, mask):
+                        # Normalize disparity into [0,1] using the valid (masked) range.
+                        d = disp[0]  # [1, H, W]
+                        m = mask[0] > 0.5
+                        if m.any():
+                            vals = d[m]
+                            lo, hi = vals.min(), vals.max()
+                        else:
+                            lo, hi = d.min(), d.max()
+                        d_norm = ((d - lo) / (hi - lo + 1e-8)).clamp(0, 1)
+                        d_norm = d_norm * mask[0]  # zero out invalid pixels
+                        return d_norm.expand(3, -1, -1)
+
+                    depth_gt_and_preds = [
+                        wandb.Image(
+                            _disp_to_rgb_vis(self._wandb_gt_disp, self._wandb_depth_mask),
+                            caption=f"Step {self.global_step} | GT disparity (target view)",
+                        ),
+                        wandb.Image(
+                            _disp_to_rgb_vis(self._wandb_pred_disp, self._wandb_depth_mask),
+                            caption=f"Step {self.global_step} | Pred disparity (depth_head)",
+                        ),
+                        wandb.Image(
+                            self._wandb_depth_mask[0].expand(3, -1, -1).clamp(0, 1),
+                            caption=f"Step {self.global_step} | depth valid mask",
+                        ),
+                    ]
+                    wandb_log["depth_gt_and_preds"] = depth_gt_and_preds
+
                 print(f"[VIS] Logged multiview (+ normals) at step {self.global_step}")
 
         print(f"LOSS logged: total={loss.item():.4f}")
@@ -615,7 +769,13 @@ class TossLoraModule(TOSS):
             param_groups.append({"params": finetune_params, "lr": self.learning_rate * 0.1, "name": "finetune"})
         if len(other_params) > 0:
             param_groups.append({"params": other_params, "lr": self.learning_rate, "name": "other"})
-        
+
+        # Depth head lives on self (not inside self.model.diffusion_model), so add it explicitly.
+        depth_head_params = [p for p in self.depth_head.parameters() if p.requires_grad]
+        if len(depth_head_params) > 0:
+            param_groups.append({"params": depth_head_params, "lr": self.learning_rate, "name": "depth_head"})
+            print(f"[OPT] depth_head params: {len(depth_head_params)}")
+
         optimizer = torch.optim.AdamW(param_groups)
         
         return optimizer

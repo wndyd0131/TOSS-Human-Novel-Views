@@ -119,6 +119,10 @@ model:
     dists_loss_weight: 0.05
     dists_t_cut: 200
 
+    # Depth head (disparity) loss
+    depth_loss_weight: 0.05
+    depth_t_cut: 200
+
     scheduler_config: # 10000 warmup steps
       target: ldm.lr_scheduler.LambdaLinearScheduler
       params:

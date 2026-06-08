@@ -1,5 +1,6 @@
 albumentations==2.0.8
 opencv-python==4.12.0.88
+rembg>=2.0.50
 imageio==2.37.2
 imageio-ffmpeg==0.4.2
 pytorch-lightning==1.9.5
