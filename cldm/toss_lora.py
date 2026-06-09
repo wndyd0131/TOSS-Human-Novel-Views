@@ -530,7 +530,7 @@ class TossLoraModule(TOSS):
                                 d_mask, size=pred_disp.shape[-2:], mode="area",
                             )
 
-                        gt_disp = d_mask / gt_depth.clamp(min=eps)
+                        gt_disp = 1.0 / gt_depth.clamp(min=eps)
 
                         depth_loss = (d_mask * (pred_disp - gt_disp).abs()).sum() / (d_mask.sum() + eps)
                         loss = loss + self.depth_loss_weight * depth_loss
