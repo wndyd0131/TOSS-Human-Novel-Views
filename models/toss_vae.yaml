@@ -113,7 +113,7 @@ model:
 
     # Normal head (decoder feature) loss
     use_normal_head: true
-    normal_head_loss_weight: 0.03
+    normal_head_loss_weight: 0.001
     normal_head_t_cut: 200
 
     # DISTS perceptual loss (image + Sobel)
@@ -121,8 +121,8 @@ model:
     dists_t_cut: 200
 
     # Depth head (decoder feature) loss
-    use_depth_head: true
-    depth_loss_weight: 0.05
+    use_depth_head: false
+    depth_loss_weight: 0.001
     depth_t_cut: 200
 
     scheduler_config: # 10000 warmup steps
