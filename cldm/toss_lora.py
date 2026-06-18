@@ -49,6 +49,17 @@ def _grayscale_sobel_3ch(rgb_01):
     return edge.expand(-1, 3, -1, -1).clamp(0.0, 1.0)
 
 
+def _set_expose_dec_feat(module, value=True):
+    """Set expose_dec_feat on the underlying UNetModel_toss (PEFT version-agnostic)."""
+    if hasattr(module, "get_base_model"):
+        base = module.get_base_model()
+        # get_base_model() may return UNetModel_toss directly or a wrapper with .model
+        target = base.model if hasattr(base, "model") else base
+        target.expose_dec_feat = value
+    else:
+        module.expose_dec_feat = value
+
+
 class DepthHead(nn.Module):
     """Predicts a disparity map from UNet decoder features.
 
@@ -225,11 +236,7 @@ class TossLoraModule(TOSS):
 
         # Ensure expose_dec_feat is set on the underlying UNet after PEFT wrapping.
         if self._need_dec_feat:
-            peft_unet = self.model.diffusion_model
-            if hasattr(peft_unet, "get_base_model"):
-                peft_unet.get_base_model().model.expose_dec_feat = True
-            else:
-                peft_unet.expose_dec_feat = True
+            _set_expose_dec_feat(self.model.diffusion_model, True)
 
         # CRITICAL: Disable checkpointing AGAIN after PEFT wrapping
         # PEFT changes module hierarchy, must ensure checkpointing is disabled
