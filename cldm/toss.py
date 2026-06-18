@@ -100,15 +100,15 @@ class TOSS(LatentDiffusion):
 
         return x, dict(c_crossattn=[c], c_concat=[control], delta_pose=delta_pose, in_concat=[concat])
     
-    def apply_model(self, x_noisy, t, cond:Dict, *args, **kwargs):
+    def apply_model(self, x_noisy, t, cond:Dict, return_aux=False, *args, **kwargs):
         assert isinstance(cond, dict)
         diffusion_model = self.model.diffusion_model
         cond_txt = torch.cat(cond['c_crossattn'], 1)
 
-        eps = diffusion_model(x=torch.cat([x_noisy] + cond['in_concat'], dim=0), \
+        out = diffusion_model(x=torch.cat([x_noisy] + cond['in_concat'], dim=0), \
                 timesteps=t, context=cond_txt, delta_pose=cond['delta_pose'])
-
-        return eps
+        eps, aux = out if isinstance(out, tuple) else (out, {})
+        return (eps, aux) if return_aux else eps
 
 
     def get_learned_conditioning(self, c):

@@ -1317,9 +1317,10 @@ class UNetModel_toss(nn.Module):
         h = h.type(x.dtype)
         B_orig = x.shape[0] // 2
         aux = {}
-        if self.depth_head is not None:
+        if getattr(self, "expose_dec_feat", False):
+            aux["dec_feat"] = h[:B_orig]  # [B, model_channels, 32, 32]
+        elif self.depth_head is not None:
             aux["depth"] = self.depth_head(h[:B_orig])  # [B, 1, H, W]
-        # Future heads: aux["normal"] = self.normal_head(h[:B_orig]), etc.
 
         if self.predict_codebook_ids:
             noise_out = self.id_predictor(h)[:x.shape[0]//2] if "CA" in self.temp_attn else self.id_predictor(h)

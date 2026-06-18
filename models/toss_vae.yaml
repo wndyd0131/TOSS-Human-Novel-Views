@@ -111,15 +111,17 @@ model:
     arcface_ckpt_path: "/content/drive/MyDrive/checkpoints/ms1mv3_arcface_r100_fp16.pth"
     arcface_spatial_mode: "cover_center" # RGB 이미지를 112×112로 맞추는 방식
 
-    # Geometry loss (frozen DPT-Hybrid normal estimator)
-    normal_estimator_path: "hf:clay3d/omnidata"
-    geometry_loss_weight: 0.03
+    # Normal head (decoder feature) loss
+    use_normal_head: true
+    normal_head_loss_weight: 0.03
+    normal_head_t_cut: 200
 
     # DISTS perceptual loss (image + Sobel)
     dists_loss_weight: 0.05
     dists_t_cut: 200
 
-    # Depth head (disparity) loss
+    # Depth head (decoder feature) loss
+    use_depth_head: true
     depth_loss_weight: 0.05
     depth_t_cut: 200
 

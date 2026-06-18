@@ -50,15 +50,15 @@ def _grayscale_sobel_3ch(rgb_01):
 
 
 class DepthHead(nn.Module):
-    """Predicts a disparity map from the denoised latent ``x0_pred``.
+    """Predicts a disparity map from UNet decoder features.
 
-    Input:  latent [B, in_ch, 32, 32] (in_ch = VAE latent channels, 4 for SD).
+    Input:  decoder feature [B, in_ch, 32, 32] (in_ch = model_channels, 320).
     Output: disparity [B, 1, 256, 256], non-negative (softplus).
 
     Three x2 upsample+conv stages take 32 -> 64 -> 128 -> 256.
     """
 
-    def __init__(self, in_ch=4, base_ch=128):
+    def __init__(self, in_ch=320, base_ch=128):
         super().__init__()
 
         def block(c_in, c_out):
@@ -90,14 +90,55 @@ class DepthHead(nn.Module):
         x = self.out_conv(x)
         return F.softplus(x)  # disparity >= 0
 
+
+class NormalHead(nn.Module):
+    """Predicts a normal map from UNet decoder features.
+
+    Input:  decoder feature [B, in_ch, 32, 32] (in_ch = model_channels, 320).
+    Output: raw normal [B, 3, 256, 256] (L2-normalized at loss time).
+
+    Three x2 upsample+conv stages take 32 -> 64 -> 128 -> 256.
+    """
+
+    def __init__(self, in_ch=320, base_ch=128):
+        super().__init__()
+
+        def block(c_in, c_out):
+            return nn.Sequential(
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                nn.Conv2d(c_in, c_out, kernel_size=3, padding=1),
+                nn.GroupNorm(8, c_out),
+                nn.SiLU(),
+                nn.Conv2d(c_out, c_out, kernel_size=3, padding=1),
+                nn.GroupNorm(8, c_out),
+                nn.SiLU(),
+            )
+
+        self.in_conv = nn.Sequential(
+            nn.Conv2d(in_ch, base_ch, kernel_size=3, padding=1),
+            nn.GroupNorm(8, base_ch),
+            nn.SiLU(),
+        )
+        self.up1 = block(base_ch, base_ch)          # 32 -> 64
+        self.up2 = block(base_ch, base_ch // 2)     # 64 -> 128
+        self.up3 = block(base_ch // 2, base_ch // 4)  # 128 -> 256
+        self.out_conv = nn.Conv2d(base_ch // 4, 3, kernel_size=3, padding=1)
+
+    def forward(self, z):
+        x = self.in_conv(z)
+        x = self.up1(x)
+        x = self.up2(x)
+        x = self.up3(x)
+        return self.out_conv(x)
+
 class TossLoraModule(TOSS):
     def __init__(
         self,
         lora_config_params,
         *args,
-        normal_estimator_path="hf:clay3d/omnidata",
-        geometry_loss_weight=0.0,
-        geometry_t_cut=200,
+        normal_head_loss_weight=0.0,
+        normal_head_t_cut=200,
+        use_normal_head=False,
         identity_loss_weight=0.0,
         identity_t_cut=200,
         arcface_ckpt_path=None,
@@ -106,12 +147,16 @@ class TossLoraModule(TOSS):
         dists_t_cut=200,
         depth_loss_weight=0.0,
         depth_t_cut=200,
+        use_depth_head=False,
         **kwargs,
     ):
         kwargs.pop("lora_config_params", None)  # consumed by us
-        self.normal_estimator_path = kwargs.pop("normal_estimator_path", normal_estimator_path)
-        self.geometry_loss_weight = kwargs.pop("geometry_loss_weight", geometry_loss_weight)
-        self.geometry_t_cut = int(kwargs.pop("geometry_t_cut", geometry_t_cut))
+        kwargs.pop("normal_estimator_path", None)
+        kwargs.pop("geometry_loss_weight", None)
+        kwargs.pop("geometry_t_cut", None)
+        self.use_normal_head = bool(kwargs.pop("use_normal_head", use_normal_head))
+        self.normal_head_loss_weight = float(kwargs.pop("normal_head_loss_weight", normal_head_loss_weight))
+        self.normal_head_t_cut = int(kwargs.pop("normal_head_t_cut", normal_head_t_cut))
         self.identity_loss_weight = float(kwargs.pop("identity_loss_weight", identity_loss_weight))
         self.identity_t_cut = int(kwargs.pop("identity_t_cut", identity_t_cut))
         self.arcface_ckpt_path = kwargs.pop("arcface_ckpt_path", arcface_ckpt_path)
@@ -120,8 +165,8 @@ class TossLoraModule(TOSS):
         self.dists_t_cut = int(kwargs.pop("dists_t_cut", dists_t_cut))
         self.depth_loss_weight = float(kwargs.pop("depth_loss_weight", depth_loss_weight))
         self.depth_t_cut = int(kwargs.pop("depth_t_cut", depth_t_cut))
+        self.use_depth_head = bool(kwargs.pop("use_depth_head", use_depth_head))
         super().__init__(*args, **kwargs)
-        self._normal_estimator = None
         self._arcface_backbone = None
         self._dists_model = None
 
@@ -149,15 +194,22 @@ class TossLoraModule(TOSS):
                 # DISTS perceptual loss (image + Sobel)
                 "dists_loss_weight": self.dists_loss_weight,
                 "dists_t_cut": self.dists_t_cut,
-                "geometry_loss_weight": self.geometry_loss_weight,
-                "geometry_t_cut": self.geometry_t_cut,
-                # Depth head (disparity) loss
+                # Normal head (decoder feature) loss
+                "use_normal_head": self.use_normal_head,
+                "normal_head_loss_weight": self.normal_head_loss_weight,
+                "normal_head_t_cut": self.normal_head_t_cut,
+                # Depth head (decoder feature) loss
+                "use_depth_head": self.use_depth_head,
                 "depth_loss_weight": self.depth_loss_weight,
                 "depth_t_cut": self.depth_t_cut,
             },
         )
 
         unet = self.model.diffusion_model
+        model_channels = unet.model_channels
+        self._need_dec_feat = self.use_normal_head or self.use_depth_head
+        if self._need_dec_feat:
+            unet.expose_dec_feat = True
         def disable_all_ckpt(m):
             for attr in ["use_checkpoint", "checkpoint", "use_checkpointing"]:
                 if hasattr(m, attr):
@@ -170,6 +222,14 @@ class TossLoraModule(TOSS):
         # 2. Configure LoRA (Critical)
         peft_config = LoraConfig(**lora_config_params)
         self.model.diffusion_model = get_peft_model(self.model.diffusion_model, peft_config)
+
+        # Ensure expose_dec_feat is set on the underlying UNet after PEFT wrapping.
+        if self._need_dec_feat:
+            peft_unet = self.model.diffusion_model
+            if hasattr(peft_unet, "get_base_model"):
+                peft_unet.get_base_model().model.expose_dec_feat = True
+            else:
+                peft_unet.expose_dec_feat = True
 
         # CRITICAL: Disable checkpointing AGAIN after PEFT wrapping
         # PEFT changes module hierarchy, must ensure checkpointing is disabled
@@ -211,12 +271,25 @@ class TossLoraModule(TOSS):
         self.mse_weight = 1.0  # Small MSE component for stability
         self.mask_min_weight = 0.2  # Soft mask: background contributes 20%, face contributes 100%
 
-        # Depth head: predicts target-view disparity from the denoised latent x0_pred.
-        # Created AFTER self.requires_grad_(False) so its params stay trainable.
-        self.depth_head = DepthHead(in_ch=self.channels)
-        for p in self.depth_head.parameters():
-            p.requires_grad = True
-        print(f"[INIT] Created depth_head (in_ch={self.channels}), trainable")
+        # Normal/depth heads: predict from UNet decoder features (not x0 latent).
+        # Created AFTER self.requires_grad_(False) so their params stay trainable.
+        self.normal_head = None
+        self.depth_head = None
+        if self.use_normal_head:
+            self.normal_head = NormalHead(in_ch=model_channels)
+            for p in self.normal_head.parameters():
+                p.requires_grad = True
+            print(f"[INIT] Created normal_head (in_ch={model_channels}), trainable")
+        else:
+            print("[INIT] normal_head disabled (use_normal_head=False)")
+
+        if self.use_depth_head:
+            self.depth_head = DepthHead(in_ch=model_channels)
+            for p in self.depth_head.parameters():
+                p.requires_grad = True
+            print(f"[INIT] Created depth_head (in_ch={model_channels}), trainable")
+        else:
+            print("[INIT] depth_head disabled (use_depth_head=False)")
 
     def _decode_first_stage_train(self, z):
         """Like ``decode_first_stage`` but without grad-disabled decorator so x0 gradients reach RGB."""
@@ -255,15 +328,6 @@ class TossLoraModule(TOSS):
             return torch.cuda.amp.autocast(enabled=False)
         return nullcontext()
 
-    @property
-    def normal_estimator(self):
-        """Lazy-load frozen DPT-Hybrid normal estimator."""
-        if self._normal_estimator is None:
-            from ldm.modules.midas.api import DPTNormalInference
-            self._normal_estimator = DPTNormalInference(self.normal_estimator_path).to(self.device)
-            print(f"[INIT] Loaded DPT-Hybrid normal estimator from {self.normal_estimator_path}")
-        return self._normal_estimator
-
     def on_save_checkpoint(self, checkpoint):
         # We override this to prevent the parent class from 
         # trying to call self.embedding_manager.save()
@@ -293,8 +357,10 @@ class TossLoraModule(TOSS):
                 "identity_t_cut": self.identity_t_cut,
                 "dists_loss_weight": self.dists_loss_weight,
                 "dists_t_cut": self.dists_t_cut,
-                "geometry_loss_weight": self.geometry_loss_weight,
-                "geometry_t_cut": self.geometry_t_cut,
+                "use_normal_head": self.use_normal_head,
+                "normal_head_loss_weight": self.normal_head_loss_weight,
+                "normal_head_t_cut": self.normal_head_t_cut,
+                "use_depth_head": self.use_depth_head,
                 "depth_loss_weight": self.depth_loss_weight,
                 "depth_t_cut": self.depth_t_cut,
             }, allow_val_change=True)
@@ -316,7 +382,13 @@ class TossLoraModule(TOSS):
         x_noisy = self.q_sample(x_start=x, t=t, noise=noise)
 
         '''Forward'''
-        model_output = self.apply_model(x_noisy, t, cond)
+        need_aux = self._need_dec_feat
+        if need_aux:
+            model_output, aux = self.apply_model(x_noisy, t, cond, return_aux=True)
+            dec_feat = aux.get("dec_feat")
+        else:
+            model_output = self.apply_model(x_noisy, t, cond)
+            dec_feat = None
 
         mse_loss = F.mse_loss(model_output, noise, reduction="mean")
 
@@ -340,41 +412,38 @@ class TossLoraModule(TOSS):
 
         identity_loss = None
         dists_loss = None
-        geom_loss = None
+        normal_loss = None
         depth_loss = None
         d_img = None
         d_sobel = None
 
         need_identity = self.identity_loss_weight > 0.0
         need_dists    = self.dists_loss_weight    > 0.0
-        need_geometry = (
-            self.geometry_loss_weight > 0.0
+        need_normal = (
+            self.use_normal_head
+            and self.normal_head_loss_weight > 0.0
             and "normal" in batch
             and "normal_mask" in batch
         )
         need_depth = (
-            self.depth_loss_weight > 0.0
+            self.use_depth_head
+            and self.depth_loss_weight > 0.0
             and "depth" in batch
             and "depth_mask" in batch
         )
 
-        # Decode pred_rgb / gt_rgb ONCE on the union mask so identity, DISTS,
-        # and geometry share a single VAE-decoder forward + backward graph
-        # (memory win: avoids running the decoder twice). t가 높을 경우 너무 noisy하기 때문에
-        # 예측이 불안정하여, timestep가 높은 경우에는 비교하지 않음.
-        if need_identity or need_dists or need_geometry or need_depth:
+        # Decode pred_rgb / gt_rgb for identity and DISTS (requires VAE decode).
+        if need_identity or need_dists:
             union_cut = max(
                 self.identity_t_cut if need_identity else 0,
                 self.dists_t_cut    if need_dists    else 0,
-                self.geometry_t_cut if need_geometry else 0,
-                self.depth_t_cut    if need_depth    else 0,
             )
             sel = t < union_cut
             if torch.any(sel):
-                x0_pred = self.predict_start_from_noise(x_noisy[sel], t[sel], model_output[sel]) # clean latent
-                pred_img = self._decode_first_stage_train(x0_pred) # latent to image, gradients reach RGB
-                pred_rgb = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0) # [-1, 1] to [0, 1]
-                gt_rgb = self._gt_rgb_01_from_batch(batch)[sel] # rgb to [0, 1]
+                x0_pred = self.predict_start_from_noise(x_noisy[sel], t[sel], model_output[sel])
+                pred_img = self._decode_first_stage_train(x0_pred)
+                pred_rgb = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
+                gt_rgb = self._gt_rgb_01_from_batch(batch)[sel]
                 t_sel = t[sel]
 
                 if need_identity:
@@ -414,134 +483,96 @@ class TossLoraModule(TOSS):
                         dists_loss = d_img + d_sobel
                         loss = loss + self.dists_loss_weight * dists_loss
 
-                if need_geometry:
-                    sub = t_sel < self.geometry_t_cut
-                    if torch.any(sub):
-                        pred_rgb_g = pred_rgb[sub]
-                        pred_normals = self.normal_estimator(pred_rgb_g)
-                        pred_normals = pred_normals / pred_normals.norm(dim=1, keepdim=True).clamp(min=1e-8)
-                        
-                        gt_normals = batch["normal"].to(self.device)
-                        if gt_normals.ndim == 4 and gt_normals.shape[-1] == 3:
-                            gt_normals = gt_normals.permute(0, 3, 1, 2)
-                        gt_normals = gt_normals[sel][sub]
-                        if gt_normals.shape[-2:] != pred_normals.shape[-2:]:
-                            gt_normals = F.interpolate(
-                                gt_normals,
-                                size=pred_normals.shape[-2:],
-                                mode="bilinear",
-                                align_corners=False,
-                            )
-                        gt_normals = gt_normals / gt_normals.norm(dim=1, keepdim=True).clamp(min=1e-8)
-                        gt_normals_xflip = gt_normals.clone()
-                        gt_normals_xflip[:, 0:1] *= -1
+        # Normal head loss from UNet decoder features (no VAE decode).
+        if need_normal and dec_feat is not None:
+            sel = t < self.normal_head_t_cut
+            if torch.any(sel):
+                pred_normals = self.normal_head(dec_feat[sel])
+                pred_normals = pred_normals / pred_normals.norm(dim=1, keepdim=True).clamp(min=1e-8)
 
-                        normal_mask = batch["normal_mask"].to(self.device).float()
-                        if normal_mask.ndim == 3:
-                            normal_mask = normal_mask.unsqueeze(1)
-                        normal_mask = normal_mask[sel][sub]
-                        if normal_mask.shape[-2:] != pred_normals.shape[-2:]:
-                            normal_mask = F.interpolate(
-                                normal_mask,
-                                size=pred_normals.shape[-2:],
-                                mode="area",
-                            )
+                gt_normals = batch["normal"].to(self.device)
+                if gt_normals.ndim == 4 and gt_normals.shape[-1] == 3:
+                    gt_normals = gt_normals.permute(0, 3, 1, 2)
+                gt_normals = gt_normals[sel]
+                if gt_normals.shape[-2:] != pred_normals.shape[-2:]:
+                    gt_normals = F.interpolate(
+                        gt_normals,
+                        size=pred_normals.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                gt_normals = gt_normals / gt_normals.norm(dim=1, keepdim=True).clamp(min=1e-8)
 
-                        geom_loss = _cosine_similarity_loss(
-                            pred_normals,
-                            gt_normals_xflip.detach(),
-                            normal_mask.detach(),
-                        )
+                normal_mask = batch["normal_mask"].to(self.device).float()
+                if normal_mask.ndim == 3:
+                    normal_mask = normal_mask.unsqueeze(1)
+                normal_mask = normal_mask[sel]
+                if normal_mask.shape[-2:] != pred_normals.shape[-2:]:
+                    normal_mask = F.interpolate(
+                        normal_mask,
+                        size=pred_normals.shape[-2:],
+                        mode="area",
+                    )
 
-                        with torch.no_grad():
-                            self._wandb_pred_normals = pred_normals[:1].detach()
-                            self._wandb_gt_normals_xflip = gt_normals_xflip[:1].detach()
-                            self._wandb_normal_mask = normal_mask[:1].detach()
-                            self._wandb_pred_normals_step = int(self.global_step)
+                normal_loss = _cosine_similarity_loss(
+                    pred_normals,
+                    gt_normals.detach(),
+                    normal_mask.detach(),
+                )
+                loss = loss + self.normal_head_loss_weight * normal_loss
 
-                        # gt_rgb = batch["jpg"][sel][sub]
+                with torch.no_grad():
+                    self._wandb_pred_normals = pred_normals[:1].detach()
+                    self._wandb_gt_normals = gt_normals[:1].detach()
+                    self._wandb_normal_mask = normal_mask[:1].detach()
+                    self._wandb_pred_normals_step = int(self.global_step)
 
-                        # # DEBUG
-                        # with torch.no_grad():
-                        #     dpt_on_gt = self.normal_estimator(gt_rgb)
-                        #     dpt_on_gt = dpt_on_gt / dpt_on_gt.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        # Depth head loss from UNet decoder features (no VAE decode).
+        if need_depth and dec_feat is not None:
+            sel = t < self.depth_t_cut
+            if torch.any(sel):
+                eps = 1e-6
+                pred_disp = self.depth_head(dec_feat[sel])
 
-                        #     loss_gt = _cosine_similarity_loss(
-                        #         dpt_on_gt,
-                        #         gt_normals_xflip.detach(),
-                        #         normal_mask.detach(),
-                        #     )
-                        #     print("DPT(GT RGB) vs Pixel3DMM normal:", loss_gt.item())
+                gt_depth = batch["depth"].to(self.device).float()
+                if gt_depth.ndim == 3:
+                    gt_depth = gt_depth.unsqueeze(1)
+                gt_depth = gt_depth[sel]
 
-                        # DEBUG
-                        print("geom_loss", geom_loss.item())
-                        print("mask mean", normal_mask.mean().item())
-                        print("pred normal range", pred_normals.min().item(), pred_normals.max().item())
-                        print("gt normal range", gt_normals.min().item(), gt_normals.max().item())
-                        print("pred normal norm", pred_normals.norm(dim=1).mean())
-                        print("gt normal norm", gt_normals.norm(dim=1).mean())
+                depth_mask = batch["depth_mask"].to(self.device).float()
+                if depth_mask.ndim == 3:
+                    depth_mask = depth_mask.unsqueeze(1)
+                depth_mask = depth_mask[sel]
 
-                        base = _cosine_similarity_loss(pred_normals, gt_normals, normal_mask)
+                fg_mask = batch.get("mask")
+                if fg_mask is not None:
+                    fg_mask = fg_mask.to(self.device).float()
+                    if fg_mask.ndim == 3:
+                        fg_mask = fg_mask.unsqueeze(1)
+                    fg_mask = (fg_mask[sel] > 0.5).float()
+                    d_mask = depth_mask * fg_mask
+                else:
+                    d_mask = depth_mask
 
-                        flip_x = _cosine_similarity_loss(pred_normals * torch.tensor([-1,1,1], device=pred_normals.device)[None,:,None,None], gt_normals, normal_mask)
-                        flip_y = _cosine_similarity_loss(pred_normals * torch.tensor([1,-1,1], device=pred_normals.device)[None,:,None,None], gt_normals, normal_mask)
-                        flip_z = _cosine_similarity_loss(pred_normals * torch.tensor([1,1,-1], device=pred_normals.device)[None,:,None,None], gt_normals, normal_mask)
-                        flip_yz = _cosine_similarity_loss(pred_normals * torch.tensor([1,-1,-1], device=pred_normals.device)[None,:,None,None], gt_normals, normal_mask)
+                if gt_depth.shape[-2:] != pred_disp.shape[-2:]:
+                    gt_depth = F.interpolate(
+                        gt_depth, size=pred_disp.shape[-2:],
+                        mode="bilinear", align_corners=False,
+                    )
+                if d_mask.shape[-2:] != pred_disp.shape[-2:]:
+                    d_mask = F.interpolate(
+                        d_mask, size=pred_disp.shape[-2:], mode="area",
+                    )
 
-                        print(base, flip_x, flip_y, flip_z, flip_yz)
-                        loss = loss + self.geometry_loss_weight * geom_loss
+                gt_disp = 1.0 / gt_depth.clamp(min=eps)
+                depth_loss = (d_mask * (pred_disp - gt_disp).abs()).sum() / (d_mask.sum() + eps)
+                loss = loss + self.depth_loss_weight * depth_loss
 
-                if need_depth:
-                    sub = t_sel < self.depth_t_cut
-                    if torch.any(sub):
-                        eps = 1e-6
-                        # Predict target-view disparity from the denoised latent.
-                        pred_disp = self.depth_head(x0_pred[sub])  # [b, 1, 256, 256]
-
-                        gt_depth = batch["depth"].to(self.device).float()
-                        if gt_depth.ndim == 3:
-                            gt_depth = gt_depth.unsqueeze(1)
-                        gt_depth = gt_depth[sel][sub]
-
-                        depth_mask = batch["depth_mask"].to(self.device).float()
-                        if depth_mask.ndim == 3:
-                            depth_mask = depth_mask.unsqueeze(1)
-                        depth_mask = depth_mask[sel][sub]
-
-                        # Intersect depth-valid mask with the rembg foreground mask.
-                        fg_mask = batch.get("mask")
-                        if fg_mask is not None:
-                            fg_mask = fg_mask.to(self.device).float()
-                            if fg_mask.ndim == 3:
-                                fg_mask = fg_mask.unsqueeze(1)
-                            fg_mask = (fg_mask[sel][sub] > 0.5).float()
-                            d_mask = depth_mask * fg_mask
-                        else:
-                            d_mask = depth_mask
-
-                        # Match spatial sizes to the predicted disparity.
-                        if gt_depth.shape[-2:] != pred_disp.shape[-2:]:
-                            gt_depth = F.interpolate(
-                                gt_depth, size=pred_disp.shape[-2:],
-                                mode="bilinear", align_corners=False,
-                            )
-                        if d_mask.shape[-2:] != pred_disp.shape[-2:]:
-                            d_mask = F.interpolate(
-                                d_mask, size=pred_disp.shape[-2:], mode="area",
-                            )
-
-                        gt_disp = 1.0 / gt_depth.clamp(min=eps)
-
-                        depth_loss = (d_mask * (pred_disp - gt_disp).abs()).sum() / (d_mask.sum() + eps)
-                        loss = loss + self.depth_loss_weight * depth_loss
-
-                        with torch.no_grad():
-                            self._wandb_pred_disp = pred_disp[:1].detach()
-                            self._wandb_gt_disp = gt_disp[:1].detach()
-                            self._wandb_depth_mask = d_mask[:1].detach()
-                            self._wandb_depth_step = int(self.global_step)
-
-                        print("depth_loss", depth_loss.item())
+                with torch.no_grad():
+                    self._wandb_pred_disp = pred_disp[:1].detach()
+                    self._wandb_gt_disp = gt_disp[:1].detach()
+                    self._wandb_depth_mask = d_mask[:1].detach()
+                    self._wandb_depth_step = int(self.global_step)
 
         wandb_log = {
             "loss": loss,
@@ -553,8 +584,8 @@ class TossLoraModule(TOSS):
             wandb_log["dists_loss"] = dists_loss
             wandb_log["dists_loss_img"] = d_img
             wandb_log["dists_loss_sobel"] = d_sobel
-        if geom_loss is not None:
-            wandb_log["geometry_loss"] = geom_loss
+        if normal_loss is not None:
+            wandb_log["normal_loss"] = normal_loss
         if depth_loss is not None:
             wandb_log["depth_loss"] = depth_loss
 
@@ -599,12 +630,13 @@ class TossLoraModule(TOSS):
                     )
 
                     if (
-                        self.geometry_loss_weight > 0.0
+                        self.use_normal_head
+                        and self.normal_head_loss_weight > 0.0
                         and getattr(self, "_wandb_pred_normals_step", -1) == int(self.global_step)
                         and getattr(self, "_wandb_pred_normals", None) is not None
                     ):
                         pred_normals_vis = self._wandb_pred_normals
-                        gt_xflip_vis = getattr(self, "_wandb_gt_normals_xflip", None)
+                        gt_vis = getattr(self, "_wandb_gt_normals", None)
                         nm_pred = self._wandb_normal_mask
                         if nm_pred.ndim == 3:
                             nm_pred = nm_pred.unsqueeze(1)
@@ -615,16 +647,16 @@ class TossLoraModule(TOSS):
                         normal_gt_and_preds.append(
                             wandb.Image(
                                 vis_pred,
-                                caption=f"Step {self.global_step} | Pred normal * mask",
+                                caption=f"Step {self.global_step} | Pred normal (normal_head) * mask",
                             )
                         )
 
-                        if gt_xflip_vis is not None:
-                            vis_gt_xflip = _normal_to_rgb_vis(gt_xflip_vis * nm_pred) * m_rgb
+                        if gt_vis is not None:
+                            vis_gt_masked = _normal_to_rgb_vis(gt_vis * nm_pred) * m_rgb
                             normal_gt_and_preds.append(
                                 wandb.Image(
-                                    vis_gt_xflip,
-                                    caption=f"Step {self.global_step} | GT normal x-flip * mask (loss target)",
+                                    vis_gt_masked,
+                                    caption=f"Step {self.global_step} | GT normal * mask (loss target)",
                                 )
                             )
 
@@ -681,7 +713,8 @@ class TossLoraModule(TOSS):
                     wandb_log["normal_gt_and_preds"] = normal_gt_and_preds
 
                 if (
-                    self.depth_loss_weight > 0.0
+                    self.use_depth_head
+                    and self.depth_loss_weight > 0.0
                     and getattr(self, "_wandb_depth_step", -1) == int(self.global_step)
                     and getattr(self, "_wandb_pred_disp", None) is not None
                 ):
@@ -770,11 +803,18 @@ class TossLoraModule(TOSS):
         if len(other_params) > 0:
             param_groups.append({"params": other_params, "lr": self.learning_rate, "name": "other"})
 
-        # Depth head lives on self (not inside self.model.diffusion_model), so add it explicitly.
-        depth_head_params = [p for p in self.depth_head.parameters() if p.requires_grad]
-        if len(depth_head_params) > 0:
-            param_groups.append({"params": depth_head_params, "lr": self.learning_rate, "name": "depth_head"})
-            print(f"[OPT] depth_head params: {len(depth_head_params)}")
+        # Normal/depth heads live on self (not inside self.model.diffusion_model).
+        if self.normal_head is not None:
+            normal_head_params = [p for p in self.normal_head.parameters() if p.requires_grad]
+            if len(normal_head_params) > 0:
+                param_groups.append({"params": normal_head_params, "lr": self.learning_rate, "name": "normal_head"})
+                print(f"[OPT] normal_head params: {len(normal_head_params)}")
+
+        if self.depth_head is not None:
+            depth_head_params = [p for p in self.depth_head.parameters() if p.requires_grad]
+            if len(depth_head_params) > 0:
+                param_groups.append({"params": depth_head_params, "lr": self.learning_rate, "name": "depth_head"})
+                print(f"[OPT] depth_head params: {len(depth_head_params)}")
 
         optimizer = torch.optim.AdamW(param_groups)
         
