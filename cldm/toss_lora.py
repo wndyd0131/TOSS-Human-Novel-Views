@@ -142,6 +142,41 @@ class NormalHead(nn.Module):
         x = self.up3(x)
         return self.out_conv(x)
 
+
+class NormalRefineHead(nn.Module):
+    """Refines coarse normals using decoded target-view RGB.
+
+    Input:  pred_rgb [B,3,H,W] in [0,1], n_coarse [B,3,H,W] (raw, unnormalized)
+    Output: refined unit normals [B,3,H,W]
+    """
+
+    def __init__(self, in_ch=6, base_ch=64):
+        super().__init__()
+
+        def block(c_in, c_out):
+            return nn.Sequential(
+                nn.Conv2d(c_in, c_out, kernel_size=3, padding=1),
+                nn.GroupNorm(8, c_out),
+                nn.SiLU(),
+                nn.Conv2d(c_out, c_out, kernel_size=3, padding=1),
+                nn.GroupNorm(8, c_out),
+                nn.SiLU(),
+            )
+
+        self.net = nn.Sequential(
+            block(in_ch, base_ch),
+            block(base_ch, base_ch),
+            block(base_ch, base_ch),
+            nn.Conv2d(base_ch, 3, kernel_size=3, padding=1),
+        )
+
+    def forward(self, pred_rgb, n_coarse):
+        x = torch.cat([pred_rgb, n_coarse], dim=1)
+        residual = self.net(x)
+        refined = n_coarse + residual
+        return refined / refined.norm(dim=1, keepdim=True).clamp(min=1e-8)
+
+
 class TossLoraModule(TOSS):
     def __init__(
         self,
@@ -150,6 +185,9 @@ class TossLoraModule(TOSS):
         normal_head_loss_weight=0.0,
         normal_head_t_cut=200,
         use_normal_head=False,
+        use_normal_refine_head=False,
+        normal_refine_loss_weight=0.005,
+        normal_refine_t_cut=100,
         identity_loss_weight=0.0,
         identity_t_cut=200,
         arcface_ckpt_path=None,
@@ -168,6 +206,9 @@ class TossLoraModule(TOSS):
         self.use_normal_head = bool(kwargs.pop("use_normal_head", use_normal_head))
         self.normal_head_loss_weight = float(kwargs.pop("normal_head_loss_weight", normal_head_loss_weight))
         self.normal_head_t_cut = int(kwargs.pop("normal_head_t_cut", normal_head_t_cut))
+        self.use_normal_refine_head = bool(kwargs.pop("use_normal_refine_head", use_normal_refine_head))
+        self.normal_refine_loss_weight = float(kwargs.pop("normal_refine_loss_weight", normal_refine_loss_weight))
+        self.normal_refine_t_cut = int(kwargs.pop("normal_refine_t_cut", normal_refine_t_cut))
         self.identity_loss_weight = float(kwargs.pop("identity_loss_weight", identity_loss_weight))
         self.identity_t_cut = int(kwargs.pop("identity_t_cut", identity_t_cut))
         self.arcface_ckpt_path = kwargs.pop("arcface_ckpt_path", arcface_ckpt_path)
@@ -209,6 +250,10 @@ class TossLoraModule(TOSS):
                 "use_normal_head": self.use_normal_head,
                 "normal_head_loss_weight": self.normal_head_loss_weight,
                 "normal_head_t_cut": self.normal_head_t_cut,
+                # Normal refine head (decoded x0) loss
+                "use_normal_refine_head": self.use_normal_refine_head,
+                "normal_refine_loss_weight": self.normal_refine_loss_weight,
+                "normal_refine_t_cut": self.normal_refine_t_cut,
                 # Depth head (decoder feature) loss
                 "use_depth_head": self.use_depth_head,
                 "depth_loss_weight": self.depth_loss_weight,
@@ -281,6 +326,7 @@ class TossLoraModule(TOSS):
         # Normal/depth heads: predict from UNet decoder features (not x0 latent).
         # Created AFTER self.requires_grad_(False) so their params stay trainable.
         self.normal_head = None
+        self.normal_refine_head = None
         self.depth_head = None
         if self.use_normal_head:
             self.normal_head = NormalHead(in_ch=model_channels)
@@ -289,6 +335,17 @@ class TossLoraModule(TOSS):
             print(f"[INIT] Created normal_head (in_ch={model_channels}), trainable")
         else:
             print("[INIT] normal_head disabled (use_normal_head=False)")
+
+        if self.use_normal_refine_head:
+            if self.normal_head is None:
+                raise ValueError("use_normal_refine_head requires use_normal_head=True (coarse head provides n_coarse)")
+            self.normal_refine_head = NormalRefineHead()
+            for p in self.normal_refine_head.parameters():
+                p.requires_grad = True
+            refine_params = sum(p.numel() for p in self.normal_refine_head.parameters())
+            print(f"[INIT] Created normal_refine_head, trainable ({refine_params} params)")
+        else:
+            print("[INIT] normal_refine_head disabled (use_normal_refine_head=False)")
 
         if self.use_depth_head:
             self.depth_head = DepthHead(in_ch=model_channels)
@@ -310,6 +367,33 @@ class TossLoraModule(TOSS):
         if x.ndim == 4 and x.shape[-1] == 3:
             x = einops.rearrange(x, "b h w c -> b c h w")
         return x.clamp(0.0, 1.0)
+
+    def _prepare_normal_gt(self, batch, sel, target_hw):
+        """Return L2-normalized GT normals and mask for the given batch selection."""
+        gt_normals = batch["normal"].to(self.device)
+        if gt_normals.ndim == 4 and gt_normals.shape[-1] == 3:
+            gt_normals = gt_normals.permute(0, 3, 1, 2)
+        gt_normals = gt_normals[sel]
+        if gt_normals.shape[-2:] != target_hw:
+            gt_normals = F.interpolate(
+                gt_normals,
+                size=target_hw,
+                mode="bilinear",
+                align_corners=False,
+            )
+        gt_normals = gt_normals / gt_normals.norm(dim=1, keepdim=True).clamp(min=1e-8)
+
+        normal_mask = batch["normal_mask"].to(self.device).float()
+        if normal_mask.ndim == 3:
+            normal_mask = normal_mask.unsqueeze(1)
+        normal_mask = normal_mask[sel]
+        if normal_mask.shape[-2:] != target_hw:
+            normal_mask = F.interpolate(
+                normal_mask,
+                size=target_hw,
+                mode="area",
+            )
+        return gt_normals, normal_mask
 
     def _ensure_arcface_backbone(self):
         if self._arcface_backbone is None:
@@ -367,6 +451,9 @@ class TossLoraModule(TOSS):
                 "use_normal_head": self.use_normal_head,
                 "normal_head_loss_weight": self.normal_head_loss_weight,
                 "normal_head_t_cut": self.normal_head_t_cut,
+                "use_normal_refine_head": self.use_normal_refine_head,
+                "normal_refine_loss_weight": self.normal_refine_loss_weight,
+                "normal_refine_t_cut": self.normal_refine_t_cut,
                 "use_depth_head": self.use_depth_head,
                 "depth_loss_weight": self.depth_loss_weight,
                 "depth_t_cut": self.depth_t_cut,
@@ -419,7 +506,8 @@ class TossLoraModule(TOSS):
 
         identity_loss = None
         dists_loss = None
-        normal_loss = None
+        normal_coarse_loss = None
+        normal_refine_loss = None
         depth_loss = None
         d_img = None
         d_sobel = None
@@ -432,6 +520,14 @@ class TossLoraModule(TOSS):
             and "normal" in batch
             and "normal_mask" in batch
         )
+        need_normal_refine = (
+            self.use_normal_refine_head
+            and self.normal_refine_loss_weight > 0.0
+            and self.normal_head is not None
+            and self.normal_refine_head is not None
+            and "normal" in batch
+            and "normal_mask" in batch
+        )
         need_depth = (
             self.use_depth_head
             and self.depth_loss_weight > 0.0
@@ -439,19 +535,24 @@ class TossLoraModule(TOSS):
             and "depth_mask" in batch
         )
 
-        # Decode pred_rgb / gt_rgb for identity and DISTS (requires VAE decode).
-        if need_identity or need_dists:
+        pred_rgb = None
+        sel_decode = None
+
+        # Decode pred_rgb / gt_rgb for identity, DISTS, and normal refine (requires VAE decode).
+        need_decode = need_identity or need_dists or need_normal_refine
+        if need_decode:
             union_cut = max(
                 self.identity_t_cut if need_identity else 0,
-                self.dists_t_cut    if need_dists    else 0,
+                self.dists_t_cut if need_dists else 0,
+                self.normal_refine_t_cut if need_normal_refine else 0,
             )
-            sel = t < union_cut
-            if torch.any(sel):
-                x0_pred = self.predict_start_from_noise(x_noisy[sel], t[sel], model_output[sel])
+            sel_decode = t < union_cut
+            if torch.any(sel_decode):
+                x0_pred = self.predict_start_from_noise(x_noisy[sel_decode], t[sel_decode], model_output[sel_decode])
                 pred_img = self._decode_first_stage_train(x0_pred)
                 pred_rgb = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
-                gt_rgb = self._gt_rgb_01_from_batch(batch)[sel]
-                t_sel = t[sel]
+                gt_rgb = self._gt_rgb_01_from_batch(batch)[sel_decode]
+                t_sel = t[sel_decode]
 
                 if need_identity:
                     sub = t_sel < self.identity_t_cut
@@ -492,47 +593,52 @@ class TossLoraModule(TOSS):
 
         # Normal head loss from UNet decoder features (no VAE decode).
         if need_normal and dec_feat is not None:
-            sel = t < self.normal_head_t_cut
-            if torch.any(sel):
-                pred_normals = self.normal_head(dec_feat[sel])
+            sel_coarse = t < self.normal_head_t_cut
+            if torch.any(sel_coarse):
+                pred_normals = self.normal_head(dec_feat[sel_coarse])
                 pred_normals = pred_normals / pred_normals.norm(dim=1, keepdim=True).clamp(min=1e-8)
 
-                gt_normals = batch["normal"].to(self.device)
-                if gt_normals.ndim == 4 and gt_normals.shape[-1] == 3:
-                    gt_normals = gt_normals.permute(0, 3, 1, 2)
-                gt_normals = gt_normals[sel]
-                if gt_normals.shape[-2:] != pred_normals.shape[-2:]:
-                    gt_normals = F.interpolate(
-                        gt_normals,
-                        size=pred_normals.shape[-2:],
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                gt_normals = gt_normals / gt_normals.norm(dim=1, keepdim=True).clamp(min=1e-8)
+                gt_normals, normal_mask = self._prepare_normal_gt(
+                    batch, sel_coarse, pred_normals.shape[-2:]
+                )
 
-                normal_mask = batch["normal_mask"].to(self.device).float()
-                if normal_mask.ndim == 3:
-                    normal_mask = normal_mask.unsqueeze(1)
-                normal_mask = normal_mask[sel]
-                if normal_mask.shape[-2:] != pred_normals.shape[-2:]:
-                    normal_mask = F.interpolate(
-                        normal_mask,
-                        size=pred_normals.shape[-2:],
-                        mode="area",
-                    )
-
-                normal_loss = _cosine_similarity_loss(
+                normal_coarse_loss = _cosine_similarity_loss(
                     pred_normals,
                     gt_normals.detach(),
                     normal_mask.detach(),
                 )
-                loss = loss + self.normal_head_loss_weight * normal_loss
+                loss = loss + self.normal_head_loss_weight * normal_coarse_loss
 
                 with torch.no_grad():
                     self._wandb_pred_normals = pred_normals[:1].detach()
                     self._wandb_gt_normals = gt_normals[:1].detach()
                     self._wandb_normal_mask = normal_mask[:1].detach()
                     self._wandb_pred_normals_step = int(self.global_step)
+
+        # Normal refine head loss from decoded x0 RGB + coarse normals.
+        if need_normal_refine and dec_feat is not None and pred_rgb is not None and sel_decode is not None:
+            sel_refine = t < self.normal_refine_t_cut
+            refine_sub = sel_refine[sel_decode]
+            if torch.any(refine_sub):
+                n_coarse = self.normal_head(dec_feat[sel_refine])
+                pred_rgb_ref = pred_rgb[refine_sub].detach()
+                n_coarse_det = n_coarse.detach()
+                n_refined = self.normal_refine_head(pred_rgb_ref, n_coarse_det)
+
+                gt_normals, normal_mask = self._prepare_normal_gt(
+                    batch, sel_refine, n_refined.shape[-2:]
+                )
+
+                normal_refine_loss = _cosine_similarity_loss(
+                    n_refined,
+                    gt_normals.detach(),
+                    normal_mask.detach(),
+                )
+                loss = loss + self.normal_refine_loss_weight * normal_refine_loss
+
+                with torch.no_grad():
+                    self._wandb_pred_normals_refined = n_refined[:1].detach()
+                    self._wandb_pred_normals_refined_step = int(self.global_step)
 
         # Depth head loss from UNet decoder features (no VAE decode).
         if need_depth and dec_feat is not None:
@@ -591,8 +697,10 @@ class TossLoraModule(TOSS):
             wandb_log["dists_loss"] = dists_loss
             wandb_log["dists_loss_img"] = d_img
             wandb_log["dists_loss_sobel"] = d_sobel
-        if normal_loss is not None:
-            wandb_log["normal_loss"] = normal_loss
+        if normal_coarse_loss is not None:
+            wandb_log["normal_coarse_loss"] = normal_coarse_loss
+        if normal_refine_loss is not None:
+            wandb_log["normal_refine_loss"] = normal_refine_loss
         if depth_loss is not None:
             wandb_log["depth_loss"] = depth_loss
 
@@ -654,9 +762,24 @@ class TossLoraModule(TOSS):
                         normal_gt_and_preds.append(
                             wandb.Image(
                                 vis_pred,
-                                caption=f"Step {self.global_step} | Pred normal (normal_head) * mask",
+                                caption=f"Step {self.global_step} | Pred normal (coarse) * mask",
                             )
                         )
+
+                        if (
+                            self.use_normal_refine_head
+                            and self.normal_refine_loss_weight > 0.0
+                            and getattr(self, "_wandb_pred_normals_refined_step", -1) == int(self.global_step)
+                            and getattr(self, "_wandb_pred_normals_refined", None) is not None
+                        ):
+                            pred_refined_vis = self._wandb_pred_normals_refined
+                            vis_refined = _normal_to_rgb_vis(pred_refined_vis * nm_pred) * m_rgb
+                            normal_gt_and_preds.append(
+                                wandb.Image(
+                                    vis_refined,
+                                    caption=f"Step {self.global_step} | Pred normal (refined) * mask",
+                                )
+                            )
 
                         if gt_vis is not None:
                             vis_gt_masked = _normal_to_rgb_vis(gt_vis * nm_pred) * m_rgb
@@ -816,6 +939,12 @@ class TossLoraModule(TOSS):
             if len(normal_head_params) > 0:
                 param_groups.append({"params": normal_head_params, "lr": self.learning_rate, "name": "normal_head"})
                 print(f"[OPT] normal_head params: {len(normal_head_params)}")
+
+        if self.normal_refine_head is not None:
+            normal_refine_params = [p for p in self.normal_refine_head.parameters() if p.requires_grad]
+            if len(normal_refine_params) > 0:
+                param_groups.append({"params": normal_refine_params, "lr": self.learning_rate, "name": "normal_refine_head"})
+                print(f"[OPT] normal_refine_head params: {len(normal_refine_params)}")
 
         if self.depth_head is not None:
             depth_head_params = [p for p in self.depth_head.parameters() if p.requires_grad]
