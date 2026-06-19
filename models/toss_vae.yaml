@@ -113,12 +113,12 @@ model:
 
     # Normal head (decoder feature) loss — coarse
     use_normal_head: true
-    normal_head_loss_weight: 0.001
+    normal_head_loss_weight: 0.01
     normal_head_t_cut: 200
 
     # Normal refine head (decoded x0) loss
     use_normal_refine_head: true
-    normal_refine_loss_weight: 0.005
+    normal_refine_loss_weight: 0.01
     normal_refine_t_cut: 100
 
     # DISTS perceptual loss (image + Sobel)
