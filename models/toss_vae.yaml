@@ -106,7 +106,7 @@ model:
     ucg_img: 0.05
 
     # Identity loss (ArcFace)
-    identity_loss_weight: 0.05
+    identity_loss_weight: 0.0
     identity_t_cut: 200 # timestep threshold
     arcface_ckpt_path: "/content/drive/MyDrive/checkpoints/ms1mv3_arcface_r100_fp16.pth"
     arcface_spatial_mode: "cover_center" # RGB 이미지를 112×112로 맞추는 방식
@@ -122,7 +122,7 @@ model:
     normal_refine_t_cut: 100
 
     # DISTS perceptual loss (image + Sobel)
-    dists_loss_weight: 0.05
+    dists_loss_weight: 0.0
     dists_t_cut: 200
 
     # Depth head (decoder feature) loss
