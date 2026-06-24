@@ -144,37 +144,62 @@ class NormalHead(nn.Module):
 
 
 class NormalRefineHead(nn.Module):
-    """Refines coarse normals using decoded target-view RGB.
-
-    Input:  pred_rgb [B,3,H,W] in [0,1], n_coarse [B,3,H,W] (raw, unnormalized)
-    Output: refined unit normals [B,3,H,W]
-    """
+    """Stronger fusion head from decoded target-view RGB + coarse normal."""
 
     def __init__(self, in_ch=6, base_ch=64):
         super().__init__()
 
         def block(c_in, c_out):
             return nn.Sequential(
-                nn.Conv2d(c_in, c_out, kernel_size=3, padding=1),
+                nn.Conv2d(c_in, c_out, 3, padding=1),
                 nn.GroupNorm(8, c_out),
                 nn.SiLU(),
-                nn.Conv2d(c_out, c_out, kernel_size=3, padding=1),
+                nn.Conv2d(c_out, c_out, 3, padding=1),
                 nn.GroupNorm(8, c_out),
                 nn.SiLU(),
             )
 
-        self.net = nn.Sequential(
-            block(in_ch, base_ch),
-            block(base_ch, base_ch),
-            block(base_ch, base_ch),
-            nn.Conv2d(base_ch, 3, kernel_size=3, padding=1),
+        self.enc1 = block(in_ch, base_ch)          # 256
+        self.down1 = nn.Conv2d(base_ch, base_ch, 4, stride=2, padding=1)  # 128
+        self.enc2 = block(base_ch, base_ch * 2)
+
+        self.down2 = nn.Conv2d(base_ch * 2, base_ch * 2, 4, stride=2, padding=1)  # 64
+        self.mid = block(base_ch * 2, base_ch * 4)
+
+        self.up1 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(base_ch * 4, base_ch * 2, 3, padding=1),
+            nn.GroupNorm(8, base_ch * 2),
+            nn.SiLU(),
         )
+        self.dec1 = block(base_ch * 4, base_ch * 2)
+
+        self.up2 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(base_ch * 2, base_ch, 3, padding=1),
+            nn.GroupNorm(8, base_ch),
+            nn.SiLU(),
+        )
+        self.dec2 = block(base_ch * 2, base_ch)
+
+        self.out = nn.Conv2d(base_ch, 3, 3, padding=1)
 
     def forward(self, pred_rgb, n_coarse):
+        n_coarse = F.normalize(n_coarse, dim=1, eps=1e-8)
         x = torch.cat([pred_rgb, n_coarse], dim=1)
-        residual = self.net(x)
-        refined = n_coarse + residual
-        return refined / refined.norm(dim=1, keepdim=True).clamp(min=1e-8)
+
+        e1 = self.enc1(x)          # 256
+        e2 = self.enc2(self.down1(e1))  # 128
+        m = self.mid(self.down2(e2))    # 64
+
+        d1 = self.up1(m)
+        d1 = self.dec1(torch.cat([d1, e2], dim=1))
+
+        d2 = self.up2(d1)
+        d2 = self.dec2(torch.cat([d2, e1], dim=1))
+
+        out = self.out(d2)
+        return F.normalize(out, dim=1, eps=1e-8)
 
 
 class TossLoraModule(TOSS):
