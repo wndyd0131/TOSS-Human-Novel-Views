@@ -621,9 +621,8 @@ class TossLoraModule(TOSS):
             refine_sub = sel_refine[sel_decode]
             if torch.any(refine_sub):
                 n_coarse = self.normal_head(dec_feat[sel_refine])
-                pred_rgb_ref = pred_rgb[refine_sub].detach()
-                n_coarse_det = n_coarse.detach()
-                n_refined = self.normal_refine_head(pred_rgb_ref, n_coarse_det)
+                pred_rgb_ref = pred_rgb[refine_sub]
+                n_refined = self.normal_refine_head(pred_rgb_ref, n_coarse)
 
                 gt_normals, normal_mask = self._prepare_normal_gt(
                     batch, sel_refine, n_refined.shape[-2:]
