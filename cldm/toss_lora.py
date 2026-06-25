@@ -695,11 +695,8 @@ class TossLoraModule(TOSS):
             if torch.any(refine_sub):
                 n_coarse = self.normal_head(dec_feat[sel_refine])
 
-                # oracle test: use GT target RGB instead of decoded pred_rgb
-                gt_rgb_all = self._gt_rgb_01_from_batch(batch)
-                gt_rgb_ref = gt_rgb_all[sel_refine]
-
-                n_refined = self.normal_refine_head(gt_rgb_ref, n_coarse)
+                pred_rgb_ref = pred_rgb[refine_sub]
+                n_refined = self.normal_refine_head(pred_rgb_ref, n_coarse)
 
                 gt_normals, normal_mask = self._prepare_normal_gt(
                     batch, sel_refine, n_refined.shape[-2:]
