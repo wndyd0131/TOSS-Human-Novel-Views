@@ -34,6 +34,26 @@ def _cosine_similarity_loss(pred_normals, gt_normals, mask, eps=1e-8):
         return loss.sum() / (mask.sum() + eps)
     return loss.mean()
 
+
+def _normal_gradient_loss(pred_normals, gt_normals, mask, eps=1e-8):
+    """Masked L1 loss on finite-difference spatial gradients of normal components."""
+    dx_pred = pred_normals[:, :, :, 1:] - pred_normals[:, :, :, :-1]
+    dy_pred = pred_normals[:, :, 1:, :] - pred_normals[:, :, :-1, :]
+    dx_gt = gt_normals[:, :, :, 1:] - gt_normals[:, :, :, :-1]
+    dy_gt = gt_normals[:, :, 1:, :] - gt_normals[:, :, :-1, :]
+
+    loss_x = (dx_pred - dx_gt).abs().mean(dim=1, keepdim=True)
+    loss_y = (dy_pred - dy_gt).abs().mean(dim=1, keepdim=True)
+
+    if mask is not None:
+        mask_x = mask[:, :, :, 1:] * mask[:, :, :, :-1]
+        mask_y = mask[:, :, 1:, :] * mask[:, :, :-1, :]
+        loss_x = loss_x * mask_x
+        loss_y = loss_y * mask_y
+        denom = mask_x.sum() + mask_y.sum()
+        return (loss_x.sum() + loss_y.sum()) / (denom + eps)
+    return (loss_x.mean() + loss_y.mean()) / 2
+
 def _normal_to_rgb_vis(norm):
     """Map unit normal field to RGB in [0,1] for visualization. norm: [B,3,H,W] or [3,H,W]. Returns [3,H,W]."""
     if norm.dim() == 4:
@@ -213,6 +233,8 @@ class TossLoraModule(TOSS):
         use_normal_refine_head=False,
         normal_refine_loss_weight=0.005,
         normal_refine_t_cut=100,
+        coarse_grad_loss_weight=0.0,
+        refine_grad_loss_weight=0.0,
         identity_loss_weight=0.0,
         identity_t_cut=200,
         arcface_ckpt_path=None,
@@ -234,6 +256,8 @@ class TossLoraModule(TOSS):
         self.use_normal_refine_head = bool(kwargs.pop("use_normal_refine_head", use_normal_refine_head))
         self.normal_refine_loss_weight = float(kwargs.pop("normal_refine_loss_weight", normal_refine_loss_weight))
         self.normal_refine_t_cut = int(kwargs.pop("normal_refine_t_cut", normal_refine_t_cut))
+        self.coarse_grad_loss_weight = float(kwargs.pop("coarse_grad_loss_weight", coarse_grad_loss_weight))
+        self.refine_grad_loss_weight = float(kwargs.pop("refine_grad_loss_weight", refine_grad_loss_weight))
         self.identity_loss_weight = float(kwargs.pop("identity_loss_weight", identity_loss_weight))
         self.identity_t_cut = int(kwargs.pop("identity_t_cut", identity_t_cut))
         self.arcface_ckpt_path = kwargs.pop("arcface_ckpt_path", arcface_ckpt_path)
@@ -279,6 +303,8 @@ class TossLoraModule(TOSS):
                 "use_normal_refine_head": self.use_normal_refine_head,
                 "normal_refine_loss_weight": self.normal_refine_loss_weight,
                 "normal_refine_t_cut": self.normal_refine_t_cut,
+                "coarse_grad_loss_weight": self.coarse_grad_loss_weight,
+                "refine_grad_loss_weight": self.refine_grad_loss_weight,
                 # Depth head (decoder feature) loss
                 "use_depth_head": self.use_depth_head,
                 "depth_loss_weight": self.depth_loss_weight,
@@ -479,6 +505,8 @@ class TossLoraModule(TOSS):
                 "use_normal_refine_head": self.use_normal_refine_head,
                 "normal_refine_loss_weight": self.normal_refine_loss_weight,
                 "normal_refine_t_cut": self.normal_refine_t_cut,
+                "coarse_grad_loss_weight": self.coarse_grad_loss_weight,
+                "refine_grad_loss_weight": self.refine_grad_loss_weight,
                 "use_depth_head": self.use_depth_head,
                 "depth_loss_weight": self.depth_loss_weight,
                 "depth_t_cut": self.depth_t_cut,
@@ -532,7 +560,9 @@ class TossLoraModule(TOSS):
         identity_loss = None
         dists_loss = None
         normal_coarse_loss = None
+        normal_coarse_grad_loss = None
         normal_refine_loss = None
+        normal_refine_grad_loss = None
         depth_loss = None
         d_img = None
         d_sobel = None
@@ -541,13 +571,19 @@ class TossLoraModule(TOSS):
         need_dists    = self.dists_loss_weight    > 0.0
         need_normal = (
             self.use_normal_head
-            and self.normal_head_loss_weight > 0.0
+            and (
+                self.normal_head_loss_weight > 0.0
+                or self.coarse_grad_loss_weight > 0.0
+            )
             and "normal" in batch
             and "normal_mask" in batch
         )
         need_normal_refine = (
             self.use_normal_refine_head
-            and self.normal_refine_loss_weight > 0.0
+            and (
+                self.normal_refine_loss_weight > 0.0
+                or self.refine_grad_loss_weight > 0.0
+            )
             and self.normal_head is not None
             and self.normal_refine_head is not None
             and "normal" in batch
@@ -627,12 +663,24 @@ class TossLoraModule(TOSS):
                     batch, sel_coarse, pred_normals.shape[-2:]
                 )
 
-                normal_coarse_loss = _cosine_similarity_loss(
-                    pred_normals,
-                    gt_normals.detach(),
-                    normal_mask.detach(),
-                )
-                loss = loss + self.normal_head_loss_weight * normal_coarse_loss
+                gt_normals_det = gt_normals.detach()
+                normal_mask_det = normal_mask.detach()
+
+                if self.normal_head_loss_weight > 0.0:
+                    normal_coarse_loss = _cosine_similarity_loss(
+                        pred_normals,
+                        gt_normals_det,
+                        normal_mask_det,
+                    )
+                    loss = loss + self.normal_head_loss_weight * normal_coarse_loss
+
+                if self.coarse_grad_loss_weight > 0.0:
+                    normal_coarse_grad_loss = _normal_gradient_loss(
+                        pred_normals,
+                        gt_normals_det,
+                        normal_mask_det,
+                    )
+                    loss = loss + self.coarse_grad_loss_weight * normal_coarse_grad_loss
 
                 with torch.no_grad():
                     self._wandb_pred_normals = pred_normals[:1].detach()
@@ -657,12 +705,24 @@ class TossLoraModule(TOSS):
                     batch, sel_refine, n_refined.shape[-2:]
                 )
 
-                normal_refine_loss = _cosine_similarity_loss(
-                    n_refined,
-                    gt_normals.detach(),
-                    normal_mask.detach(),
-                )
-                loss = loss + self.normal_refine_loss_weight * normal_refine_loss
+                gt_normals_det = gt_normals.detach()
+                normal_mask_det = normal_mask.detach()
+
+                if self.normal_refine_loss_weight > 0.0:
+                    normal_refine_loss = _cosine_similarity_loss(
+                        n_refined,
+                        gt_normals_det,
+                        normal_mask_det,
+                    )
+                    loss = loss + self.normal_refine_loss_weight * normal_refine_loss
+
+                if self.refine_grad_loss_weight > 0.0:
+                    normal_refine_grad_loss = _normal_gradient_loss(
+                        n_refined,
+                        gt_normals_det,
+                        normal_mask_det,
+                    )
+                    loss = loss + self.refine_grad_loss_weight * normal_refine_grad_loss
 
                 with torch.no_grad():
                     self._wandb_pred_normals_refined = n_refined[:1].detach()
@@ -727,8 +787,12 @@ class TossLoraModule(TOSS):
             wandb_log["dists_loss_sobel"] = d_sobel
         if normal_coarse_loss is not None:
             wandb_log["normal_coarse_loss"] = normal_coarse_loss
+        if normal_coarse_grad_loss is not None:
+            wandb_log["normal_coarse_grad_loss"] = normal_coarse_grad_loss
         if normal_refine_loss is not None:
             wandb_log["normal_refine_loss"] = normal_refine_loss
+        if normal_refine_grad_loss is not None:
+            wandb_log["normal_refine_grad_loss"] = normal_refine_grad_loss
         if depth_loss is not None:
             wandb_log["depth_loss"] = depth_loss
 
