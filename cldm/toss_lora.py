@@ -537,25 +537,23 @@ class TossLoraModule(TOSS):
             model_output = self.apply_model(x_noisy, t, cond)
             dec_feat = None
 
-        mse_loss = F.mse_loss(model_output, noise, reduction="mean")
+        per_pixel_mse = F.mse_loss(model_output, noise, reduction="none")
 
-        '''Masked Loss'''
-        # mask = None
-        mask = batch.get("mask")  # Original mask [B, 1, 256, 256]
+        mask = batch.get("mask")  # Original mask [B, 1, 256, 256] or [B, H, W]
+        if mask is not None:
+            mask = mask.to(self.device).float()
+            if mask.ndim == 4 and mask.shape[-1] == 1:
+                mask = mask.permute(0, 3, 1, 2)
+            if mask.ndim == 3:
+                mask = mask.unsqueeze(1)
+            # Soft mask: mask=1 (face) -> weight=1.0, mask=0 (background) -> weight=min_weight
+            soft_mask = mask * (1.0 - self.mask_min_weight) + self.mask_min_weight
+            latent_mask = F.interpolate(soft_mask, size=model_output.shape[-2:], mode="area")
+            mse_loss = (per_pixel_mse * latent_mask).sum() / latent_mask.sum().clamp(min=1e-8)
+        else:
+            mse_loss = per_pixel_mse.mean()
 
-        # if mask is not None:
-        #     mask = mask.to(self.device)
-        #     # Soft mask: mask=1 (face) -> weight=1.0, mask=0 (background) -> weight=min_weight
-        #     soft_mask = mask * (1.0 - self.mask_min_weight) + self.mask_min_weight
-
-        #     # Masked latent MSE, normalized by mask sum to avoid diluting head signal
-        #     latent_mask = F.interpolate(soft_mask, size=model_output.shape[-2:], mode="area")
-        #     masked_mse_loss = (F.mse_loss(model_output, noise, reduction="none") * latent_mask).sum() / latent_mask.sum()
-
-        #     loss = self.mse_weight * masked_mse_loss
-        #     print(f"MASKED LOSS: mse={masked_mse_loss.item():.4f}")
-        # else:
-        loss = mse_loss
+        loss = self.mse_weight * mse_loss
 
         identity_loss = None
         dists_loss = None
@@ -696,6 +694,7 @@ class TossLoraModule(TOSS):
                 n_coarse = self.normal_head(dec_feat[sel_refine])
 
                 pred_rgb_ref = pred_rgb[refine_sub]
+                pred_rgb_ref = F.avg_pool2d(pred_rgb_ref, kernel_size=5, stride=1, padding=2)
                 n_refined = self.normal_refine_head(pred_rgb_ref, n_coarse)
 
                 gt_normals, normal_mask = self._prepare_normal_gt(
