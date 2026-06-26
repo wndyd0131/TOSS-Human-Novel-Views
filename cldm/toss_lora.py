@@ -694,7 +694,6 @@ class TossLoraModule(TOSS):
                 n_coarse = self.normal_head(dec_feat[sel_refine])
 
                 pred_rgb_ref = pred_rgb[refine_sub]
-                pred_rgb_ref = F.avg_pool2d(pred_rgb_ref, kernel_size=5, stride=1, padding=2)
                 n_refined = self.normal_refine_head(pred_rgb_ref, n_coarse)
 
                 gt_normals, normal_mask = self._prepare_normal_gt(
