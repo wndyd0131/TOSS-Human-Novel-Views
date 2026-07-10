@@ -61,6 +61,10 @@ class TossLoraModule(TOSS):
         arcface_spatial_mode="cover_center",
         dists_loss_weight=0.0,
         dists_t_cut=200,
+        lambda_corr=0.01,
+        corr_embed_dim=128,
+        corr_proj_trainable=True,
+        corr_debug_steps=5,
         **kwargs,
     ):
         kwargs.pop("lora_config_params", None)  # consumed by us
@@ -72,6 +76,11 @@ class TossLoraModule(TOSS):
         self.arcface_spatial_mode = kwargs.pop("arcface_spatial_mode", arcface_spatial_mode)
         self.dists_loss_weight = float(kwargs.pop("dists_loss_weight", dists_loss_weight))
         self.dists_t_cut = int(kwargs.pop("dists_t_cut", dists_t_cut))
+        # Correlation feature regularization config
+        self.lambda_corr = float(kwargs.pop("lambda_corr", lambda_corr))
+        self.corr_embed_dim = int(kwargs.pop("corr_embed_dim", corr_embed_dim))
+        self.corr_proj_trainable = bool(kwargs.pop("corr_proj_trainable", corr_proj_trainable))
+        self.corr_debug_steps = int(kwargs.pop("corr_debug_steps", corr_debug_steps))
         super().__init__(*args, **kwargs)
         self._normal_estimator = None
         self._arcface_backbone = None
@@ -158,6 +167,26 @@ class TossLoraModule(TOSS):
         self.mse_weight = 1.0  # Small MSE component for stability
         self.mask_min_weight = 0.2  # Soft mask: background contributes 20%, face contributes 100%
 
+        # 5. Correlation feature regularization
+        # Shared 1x1 projection: last output-block feature (320ch @ 32x32) -> low-dim corr embedding.
+        # Created AFTER requires_grad_(False), so it is trainable by default. Ablate by freezing.
+        self.corr_proj = nn.Conv2d(320, self.corr_embed_dim, kernel_size=1)
+        self.corr_proj.requires_grad_(self.corr_proj_trainable)
+        print(f"[INIT] corr_proj: 320 -> {self.corr_embed_dim} (trainable={self.corr_proj_trainable}, lambda_corr={self.lambda_corr})")
+
+        # Forward hook captures the last output-block feature [2B, 320, 32, 32] each forward.
+        # [:B] = target (noised) branch, [B:] = source branch (see apply_model batch-doubling).
+        self._corr_feat = {}
+
+        def _corr_hook(module, inp, out):
+            self._corr_feat["feat"] = out
+
+        unet = self.model.diffusion_model
+        if hasattr(unet, "base_model"):  # unwrap PEFT wrapper
+            unet = unet.base_model.model
+        unet.output_blocks[-1].register_forward_hook(_corr_hook)
+        print(f"[INIT] Registered corr feature hook on output_blocks[-1]")
+
     def _decode_first_stage_train(self, z):
         """Like ``decode_first_stage`` but without grad-disabled decorator so x0 gradients reach RGB."""
         z = (1.0 / self.scale_factor) * z
@@ -235,6 +264,81 @@ class TossLoraModule(TOSS):
                 "dists_t_cut": self.dists_t_cut,
             }, allow_val_change=True)
 
+    @staticmethod
+    def _as_bchw(t):
+        """Ensure a per-location map is [B, 1, H, W]. Accepts [B, H, W] or [B, 1, H, W]."""
+        if t.dim() == 3:
+            t = t.unsqueeze(1)
+        return t
+
+    def _compute_corr_loss(self, batch, x, debug=False):
+        """Correlation feature regularization on the captured last-output-block feature.
+
+        Returns (loss_corr, log_dict) or (None, {}) if inputs are unavailable.
+        """
+        feat = self._corr_feat.get("feat")
+        if feat is None:
+            return None, {}
+        if "corr_gt" not in batch or "valid_mask" not in batch or "flow_tgt2src" not in batch:
+            return None, {}
+
+        B = x.shape[0]
+        f_tgt = feat[:B]   # target (noised) branch, [B, 320, Hf, Wf]
+        f_src = feat[B:]   # source branch,          [B, 320, Hf, Wf]
+
+        p_tgt = F.normalize(self.corr_proj(f_tgt), dim=1)  # [B, D, Hf, Wf]
+        p_src = F.normalize(self.corr_proj(f_src), dim=1)  # [B, D, Hf, Wf]
+        feat_hw = p_tgt.shape[-2:]
+
+        # Warp projected source features into the target coordinate frame.
+        # flow_tgt2src is a normalized grid_sample grid: [B, Hf, Wf, 2], last dim = (x=width, y=height) in [-1, 1].
+        flow = batch["flow_tgt2src"].to(device=p_src.device, dtype=p_src.dtype)
+        if flow.shape[1:3] != feat_hw:
+            # normalized coords are resolution-independent -> spatially resize the grid
+            flow = F.interpolate(flow.permute(0, 3, 1, 2), size=feat_hw, mode="bilinear", align_corners=False)
+            flow = flow.permute(0, 2, 3, 1).contiguous()
+
+        warped_src = F.grid_sample(p_src, flow, mode="bilinear", padding_mode="zeros", align_corners=False)  # [B, D, Hf, Wf]
+
+        corr_pred = (warped_src * p_tgt).sum(dim=1, keepdim=True)  # [B, 1, Hf, Wf]
+
+        corr_gt = self._as_bchw(batch["corr_gt"].to(self.device).float())
+        valid_mask = self._as_bchw(batch["valid_mask"].to(self.device).float())
+
+        # Resize GT/mask to the feature resolution if they differ.
+        if corr_gt.shape[-2:] != feat_hw:
+            corr_gt = F.interpolate(corr_gt, size=feat_hw, mode="bilinear", align_corners=False)
+        if valid_mask.shape[-2:] != feat_hw:
+            valid_mask = F.interpolate(valid_mask, size=feat_hw, mode="nearest")
+
+        loss_corr = (((corr_pred - corr_gt) ** 2) * valid_mask).sum() / (valid_mask.sum() + 1e-8)
+
+        log = {"corr_loss": loss_corr}
+
+        if debug:
+            with torch.no_grad():
+                vm = valid_mask > 0.5
+                if vm.any():
+                    gt_valid = corr_gt[vm]
+                    gt_stats = (gt_valid.min().item(), gt_valid.mean().item(), gt_valid.max().item())
+                else:
+                    gt_stats = (float("nan"), float("nan"), float("nan"))
+                warped_norm = warped_src.norm(dim=1)  # [B, Hf, Wf]
+                print(
+                    f"[CORR-DEBUG step={int(self.global_step)}] "
+                    f"feat={tuple(feat.shape)} | "
+                    f"f_tgt(mean={f_tgt.mean().item():.4f},std={f_tgt.std().item():.4f}) "
+                    f"f_src(mean={f_src.mean().item():.4f},std={f_src.std().item():.4f}) | "
+                    f"flow(min={flow.min().item():.3f},max={flow.max().item():.3f}) | "
+                    f"warped_src_norm(mean={warped_norm.mean().item():.4f}) | "
+                    f"corr_pred(min={corr_pred.min().item():.4f},mean={corr_pred.mean().item():.4f},max={corr_pred.max().item():.4f}) | "
+                    f"corr_gt@valid(min={gt_stats[0]:.4f},mean={gt_stats[1]:.4f},max={gt_stats[2]:.4f}) | "
+                    f"valid_ratio={valid_mask.mean().item():.4f} | "
+                    f"loss_corr={loss_corr.item():.6f}"
+                )
+
+        return loss_corr, log
+
     def training_step(self, batch, batch_idx):
 
         # Ensure model is in training mode
@@ -278,6 +382,14 @@ class TossLoraModule(TOSS):
         dists_loss = None
         d_img = None
         d_sobel = None
+        corr_loss = None
+
+        '''Correlation feature regularization'''
+        if self.lambda_corr > 0.0:
+            debug_corr = int(self.global_step) < self.corr_debug_steps
+            corr_loss, corr_log = self._compute_corr_loss(batch, x, debug=debug_corr)
+            if corr_loss is not None:
+                loss = loss + self.lambda_corr * corr_loss
 
         need_identity = self.identity_loss_weight > 0.0
         need_dists    = self.dists_loss_weight    > 0.0
@@ -346,6 +458,8 @@ class TossLoraModule(TOSS):
             wandb_log["dists_loss"] = dists_loss
             wandb_log["dists_loss_img"] = d_img
             wandb_log["dists_loss_sobel"] = d_sobel
+        if corr_loss is not None:
+            wandb_log["corr_loss"] = corr_loss
 
         '''WanDB logging'''
         if self.global_step % 50 == 0:
@@ -493,7 +607,16 @@ class TossLoraModule(TOSS):
             param_groups.append({"params": finetune_params, "lr": self.learning_rate * 0.1, "name": "finetune"})
         if len(other_params) > 0:
             param_groups.append({"params": other_params, "lr": self.learning_rate, "name": "other"})
-        
+
+        # corr_proj lives on the LightningModule (not under diffusion_model), so add it explicitly.
+        # Skip when frozen so we can ablate the projection layer without touching this loss.
+        corr_params = [p for p in self.corr_proj.parameters() if p.requires_grad]
+        if len(corr_params) > 0:
+            param_groups.append({"params": corr_params, "lr": self.learning_rate, "name": "corr_proj"})
+            print(f"[OPT] corr_proj params: {len(corr_params)}")
+        else:
+            print("[OPT] corr_proj frozen (not added to optimizer)")
+
         optimizer = torch.optim.AdamW(param_groups)
         
         return optimizer
