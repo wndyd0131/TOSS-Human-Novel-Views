@@ -112,13 +112,13 @@ model:
     arcface_spatial_mode: "cover_center" # RGB 이미지를 112×112로 맞추는 방식
 
     # Normal head (decoder feature) loss — coarse
-    use_normal_head: true
+    use_normal_head: false
     normal_head_loss_weight: 0.01
     normal_head_t_cut: 200
     coarse_grad_loss_weight: 0.0
 
     # Normal refine head (decoded x0) loss
-    use_normal_refine_head: true
+    use_normal_refine_head: false
     normal_refine_loss_weight: 0.003
     normal_refine_t_cut: 100
     refine_grad_loss_weight: 0.05
