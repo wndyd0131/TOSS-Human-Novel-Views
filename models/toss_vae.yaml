@@ -108,29 +108,16 @@ model:
     # Identity loss (ArcFace)
     identity_loss_weight: 0.0
     identity_t_cut: 200 # timestep threshold
-    arcface_ckpt_path: "/content/drive/MyDrive/checkpoints/ms1mv3_arcface_r100_fp16.pth"
+    arcface_ckpt_path: "content/drive/MyDrive/checkpoints/ms1mv3_arcface_r100_fp16.pth"
     arcface_spatial_mode: "cover_center" # RGB 이미지를 112×112로 맞추는 방식
 
-    # Normal head (decoder feature) loss — coarse
-    use_normal_head: false
-    normal_head_loss_weight: 0.01
-    normal_head_t_cut: 200
-    coarse_grad_loss_weight: 0.0
-
-    # Normal refine head (decoded x0) loss
-    use_normal_refine_head: false
-    normal_refine_loss_weight: 0.003
-    normal_refine_t_cut: 100
-    refine_grad_loss_weight: 0.05
+    # Geometry loss (frozen DPT-Hybrid normal estimator)
+    normal_estimator_path: "hf:clay3d/omnidata"
+    geometry_loss_weight: 0.0
 
     # DISTS perceptual loss (image + Sobel)
-    dists_loss_weight: 0.0
+    dists_loss_weight: 0.00
     dists_t_cut: 200
-
-    # Depth head (decoder feature) loss
-    use_depth_head: false
-    depth_loss_weight: 0.001
-    depth_t_cut: 200
 
     scheduler_config: # 10000 warmup steps
       target: ldm.lr_scheduler.LambdaLinearScheduler
