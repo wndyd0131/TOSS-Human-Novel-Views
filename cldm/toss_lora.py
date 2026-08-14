@@ -48,6 +48,17 @@ def _grayscale_sobel_3ch(rgb_01):
     edge = sobel(gray)                      # [B, 1, H, W] L2 gradient magnitude
     return edge.expand(-1, 3, -1, -1).clamp(0.0, 1.0)
 
+def _grad_norm_l2(loss, params):
+    """L2 norm of gradients of ``loss`` w.r.t. ``params`` without modifying ``.grad``."""
+    grads = torch.autograd.grad(
+        loss, params,
+        retain_graph=True,
+        allow_unused=True,
+        create_graph=False,
+    )
+    sq = sum(g.detach().pow(2).sum() for g in grads if g is not None)
+    return sq.sqrt()
+
 class TossLoraModule(TOSS):
     def __init__(
         self,
@@ -110,6 +121,10 @@ class TossLoraModule(TOSS):
                 # DISTS perceptual loss (image + Sobel)
                 "dists_loss_weight": self.dists_loss_weight,
                 "dists_t_cut": self.dists_t_cut,
+                # Correlation feature regularization
+                "lambda_corr": self.lambda_corr,
+                "corr_embed_dim": self.corr_embed_dim,
+                "corr_proj_trainable": self.corr_proj_trainable,
             },
         )
 
@@ -244,6 +259,7 @@ class TossLoraModule(TOSS):
 
     def on_train_start(self):
         """Called by PyTorch Lightning when training starts - log trainer config"""
+        self._trainable_params = [p for p in self.parameters() if p.requires_grad]
         if run is not None and self.trainer is not None:
             run.config.update({
                 "max_epochs": self.trainer.max_epochs,
@@ -262,6 +278,9 @@ class TossLoraModule(TOSS):
                 "identity_t_cut": self.identity_t_cut,
                 "dists_loss_weight": self.dists_loss_weight,
                 "dists_t_cut": self.dists_t_cut,
+                "lambda_corr": self.lambda_corr,
+                "corr_embed_dim": self.corr_embed_dim,
+                "corr_proj_trainable": self.corr_proj_trainable,
             }, allow_val_change=True)
 
     @staticmethod
@@ -460,9 +479,18 @@ class TossLoraModule(TOSS):
             wandb_log["dists_loss_sobel"] = d_sobel
         if corr_loss is not None:
             wandb_log["corr_loss"] = corr_loss
+            wandb_log["weighted_corr_loss"] = self.lambda_corr * corr_loss
 
         '''WanDB logging'''
         if self.global_step % 50 == 0:
+            trainable = getattr(self, "_trainable_params", None) or [
+                p for p in self.parameters() if p.requires_grad
+            ]
+            wandb_log["mse_grad_norm"] = _grad_norm_l2(mse_loss, trainable)
+            if corr_loss is not None:
+                weighted_corr = self.lambda_corr * corr_loss
+                wandb_log["corr_grad_norm"] = _grad_norm_l2(weighted_corr, trainable)
+
             # Generate 4 multiview predictions from a single source image
             with torch.no_grad():
                 import math
