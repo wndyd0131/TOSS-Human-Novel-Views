@@ -7,7 +7,7 @@ omegaconf==2.3.0
 test-tube>=0.7.5
 streamlit==1.12.1
 einops==0.8.1
-transformers==4.57.3
+transformers==4.40.2
 webdataset==0.2.5
 kornia==0.8.2
 open_clip_torch==3.2.0
@@ -21,8 +21,10 @@ prettytable==3.16.0
 safetensors==0.7.0
 basicsr==1.4.2
 carvekit-colab==4.1.2
-peft==0.17.1
+peft==0.10.0
 setuptools==81.0.0
 lpips==0.1.4
 wandb==0.24.1
 DISTS-pytorch==0.1
+tokenizers==0.19.1
+huggingface_hub==0.23.0

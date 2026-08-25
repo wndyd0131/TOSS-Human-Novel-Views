@@ -59,6 +59,25 @@ def _grad_norm_l2(loss, params):
     sq = sum(g.detach().pow(2).sum() for g in grads if g is not None)
     return sq.sqrt()
 
+def _grad_probe(loss, named_tensors):
+    """Per-tensor grad norms of ``loss``.
+
+    Keeps three outcomes distinct that a plain norm collapses into ``0``:
+    ``no_requires_grad`` (never tracked), ``None`` (tracked but unreached), and an exact ``0.0000e+00``.
+    """
+    live = [(n, t) for n, t in named_tensors if t.requires_grad]
+    result = {n: "no_requires_grad" for n, t in named_tensors if not t.requires_grad}
+    if live:
+        grads = torch.autograd.grad(
+            loss, [t for _, t in live],
+            retain_graph=True,
+            allow_unused=True,
+            create_graph=False,
+        )
+        for (n, _), g in zip(live, grads):
+            result[n] = "None" if g is None else f"{g.detach().norm().item():.4e}"
+    return " ".join(f"{n}={result[n]}" for n, _ in named_tensors)
+
 class TossLoraModule(TOSS):
     def __init__(
         self,
@@ -75,7 +94,8 @@ class TossLoraModule(TOSS):
         lambda_corr=0.01,
         corr_embed_dim=128,
         corr_proj_trainable=True,
-        corr_debug_steps=5,
+        corr_debug_steps=200,
+        corr_flow_src_size=512,
         **kwargs,
     ):
         kwargs.pop("lora_config_params", None)  # consumed by us
@@ -92,6 +112,16 @@ class TossLoraModule(TOSS):
         self.corr_embed_dim = int(kwargs.pop("corr_embed_dim", corr_embed_dim))
         self.corr_proj_trainable = bool(kwargs.pop("corr_proj_trainable", corr_proj_trainable))
         self.corr_debug_steps = int(kwargs.pop("corr_debug_steps", corr_debug_steps))
+        # flow_tgt2src.npy holds pixel coordinates in a (H_src, W_src) source image; set to None
+        # if the arrays are ever regenerated as normalized [-1, 1] grid_sample coords.
+        src_size = kwargs.pop("corr_flow_src_size", corr_flow_src_size)
+        if src_size is None:
+            self.corr_flow_src_size = None
+        elif isinstance(src_size, int):
+            self.corr_flow_src_size = (src_size, src_size)
+        else:
+            self.corr_flow_src_size = (int(src_size[0]), int(src_size[1]))
+        self._corr_flow_warned = False
         super().__init__(*args, **kwargs)
         self._normal_estimator = None
         self._arcface_backbone = None
@@ -125,6 +155,7 @@ class TossLoraModule(TOSS):
                 "lambda_corr": self.lambda_corr,
                 "corr_embed_dim": self.corr_embed_dim,
                 "corr_proj_trainable": self.corr_proj_trainable,
+                "corr_flow_src_size": self.corr_flow_src_size,
             },
         )
 
@@ -188,6 +219,7 @@ class TossLoraModule(TOSS):
         self.corr_proj = nn.Conv2d(320, self.corr_embed_dim, kernel_size=1)
         self.corr_proj.requires_grad_(self.corr_proj_trainable)
         print(f"[INIT] corr_proj: 320 -> {self.corr_embed_dim} (trainable={self.corr_proj_trainable}, lambda_corr={self.lambda_corr})")
+        print(f"[INIT] corr flow source size: {self.corr_flow_src_size} (None = already normalized)")
 
         # Forward hook captures the last output-block feature [2B, 320, 32, 32] each forward.
         # [:B] = target (noised) branch, [B:] = source branch (see apply_model batch-doubling).
@@ -281,6 +313,7 @@ class TossLoraModule(TOSS):
                 "lambda_corr": self.lambda_corr,
                 "corr_embed_dim": self.corr_embed_dim,
                 "corr_proj_trainable": self.corr_proj_trainable,
+                "corr_flow_src_size": self.corr_flow_src_size,
             }, allow_val_change=True)
 
     @staticmethod
@@ -289,6 +322,34 @@ class TossLoraModule(TOSS):
         if t.dim() == 3:
             t = t.unsqueeze(1)
         return t
+
+    def _debug_corr_grad(self, loss_corr, feat, corr_pred, p_tgt, p_src, valid_mask, numer):
+        """Walk the corr gradient chain (loss -> corr_pred -> p_tgt/p_src -> corr_proj) to find where it dies."""
+        step = int(self.global_step)
+        with torch.no_grad():
+            print(
+                f"[CORR-GRAD step={step}] "
+                f"feat(requires_grad={feat.requires_grad},grad_fn={feat.grad_fn is not None}) | "
+                f"loss(requires_grad={loss_corr.requires_grad},grad_fn={type(loss_corr.grad_fn).__name__ if loss_corr.grad_fn is not None else None}) | "
+                f"numer={numer.item():.6e} denom={valid_mask.sum().item():.4f} | "
+                f"valid_mask(n>0={int((valid_mask > 0).sum())},n>0.5={int((valid_mask > 0.5).sum())},"
+                f"numel={valid_mask.numel()},min={valid_mask.min().item():.4f},max={valid_mask.max().item():.4f})"
+            )
+
+        if not loss_corr.requires_grad:
+            print(f"[CORR-GRAD step={step}] loss_corr is detached -> no gradient path at all")
+            return
+
+        probe = [
+            ("d/dcorr_pred", corr_pred),
+            ("d/dp_tgt", p_tgt),
+            ("d/dp_src", p_src),
+            ("d/dfeat", feat),
+            ("d/dproj_w", self.corr_proj.weight),
+        ]
+        if self.corr_proj.bias is not None:
+            probe.append(("d/dproj_b", self.corr_proj.bias))
+        print(f"[CORR-GRAD step={step}] {_grad_probe(loss_corr, probe)}")
 
     def _compute_corr_loss(self, batch, x, debug=False):
         """Correlation feature regularization on the captured last-output-block feature.
@@ -310,12 +371,22 @@ class TossLoraModule(TOSS):
         feat_hw = p_tgt.shape[-2:]
 
         # Warp projected source features into the target coordinate frame.
-        # flow_tgt2src is a normalized grid_sample grid: [B, Hf, Wf, 2], last dim = (x=width, y=height) in [-1, 1].
+        # flow_tgt2src: [B, Hf, Wf, 2], last dim = (x=width, y=height).
         flow = batch["flow_tgt2src"].to(device=p_src.device, dtype=p_src.dtype)
+        if self.corr_flow_src_size is not None:
+            # Stored as pixel coords -> normalized coords. The half-pixel offset is the
+            # align_corners=False convention used by the grid_sample call below.
+            h_src, w_src = self.corr_flow_src_size
+            scale = flow.new_tensor([w_src, h_src])  # last dim is (x=width, y=height)
+            flow = (2.0 * flow + 1.0) / scale - 1.0
         if flow.shape[1:3] != feat_hw:
             # normalized coords are resolution-independent -> spatially resize the grid
             flow = F.interpolate(flow.permute(0, 3, 1, 2), size=feat_hw, mode="bilinear", align_corners=False)
             flow = flow.permute(0, 2, 3, 1).contiguous()
+
+        # Out-of-range coords silently sample as zeros under padding_mode="zeros", which kills the
+        # gradient without raising, so track how much of the supervised region actually gets sampled.
+        in_bounds = (flow.abs() <= 1.0).all(dim=-1).unsqueeze(1).float()  # [B, 1, Hf, Wf]
 
         warped_src = F.grid_sample(p_src, flow, mode="bilinear", padding_mode="zeros", align_corners=False)  # [B, D, Hf, Wf]
 
@@ -330,9 +401,43 @@ class TossLoraModule(TOSS):
         if valid_mask.shape[-2:] != feat_hw:
             valid_mask = F.interpolate(valid_mask, size=feat_hw, mode="nearest")
 
-        loss_corr = (((corr_pred - corr_gt) ** 2) * valid_mask).sum() / (valid_mask.sum() + 1e-8)
+        numer = (((corr_pred - corr_gt) ** 2) * valid_mask).sum()
+        loss_corr = numer / (valid_mask.sum() + 1e-8)
 
-        log = {"corr_loss": loss_corr}
+        in_bounds_ratio = (in_bounds * valid_mask).sum() / (valid_mask.sum() + 1e-8)
+        log = {"corr_loss": loss_corr, "corr_flow_in_bounds": in_bounds_ratio}
+
+        with torch.no_grad():
+            vm = valid_mask > 0.5
+            n_valid = int(vm.sum())
+            if n_valid >= 2:
+                pred_v = corr_pred[vm]
+                gt_v = corr_gt[vm]
+                pred_std = pred_v.std(unbiased=True)
+                gt_std = gt_v.std(unbiased=True)
+                log["corr_pred_valid_std"] = pred_std
+                log["corr_gt_valid_std"] = gt_std
+                denom = pred_std * gt_std
+                if denom > 1e-8:
+                    pred_c = pred_v - pred_v.mean()
+                    gt_c = gt_v - gt_v.mean()
+                    log["corr_pred_gt_pearson"] = (pred_c * gt_c).sum() / ((n_valid - 1) * denom)
+                else:
+                    log["corr_pred_gt_pearson"] = pred_v.new_tensor(float("nan"))
+            else:
+                nan = corr_pred.new_tensor(float("nan"))
+                log["corr_pred_valid_std"] = nan
+                log["corr_gt_valid_std"] = nan
+                log["corr_pred_gt_pearson"] = nan
+
+        if not self._corr_flow_warned and in_bounds_ratio.item() < 0.5:
+            self._corr_flow_warned = True
+            print(
+                f"[WARN] Only {in_bounds_ratio.item():.1%} of supervised flow coords land inside [-1, 1] "
+                f"(flow min={flow.min().item():.3f}, max={flow.max().item():.3f}). "
+                f"grid_sample returns zeros outside, so corr gradients will be near zero. "
+                f"Check corr_flow_src_size (currently {self.corr_flow_src_size}) and the (x, y) channel order."
+            )
 
         if debug:
             with torch.no_grad():
@@ -348,13 +453,15 @@ class TossLoraModule(TOSS):
                     f"feat={tuple(feat.shape)} | "
                     f"f_tgt(mean={f_tgt.mean().item():.4f},std={f_tgt.std().item():.4f}) "
                     f"f_src(mean={f_src.mean().item():.4f},std={f_src.std().item():.4f}) | "
-                    f"flow(min={flow.min().item():.3f},max={flow.max().item():.3f}) | "
+                    f"flow(min={flow.min().item():.3f},max={flow.max().item():.3f},"
+                    f"in_bounds@valid={in_bounds_ratio.item():.4f}) | "
                     f"warped_src_norm(mean={warped_norm.mean().item():.4f}) | "
                     f"corr_pred(min={corr_pred.min().item():.4f},mean={corr_pred.mean().item():.4f},max={corr_pred.max().item():.4f}) | "
                     f"corr_gt@valid(min={gt_stats[0]:.4f},mean={gt_stats[1]:.4f},max={gt_stats[2]:.4f}) | "
                     f"valid_ratio={valid_mask.mean().item():.4f} | "
                     f"loss_corr={loss_corr.item():.6f}"
                 )
+            self._debug_corr_grad(loss_corr, feat, corr_pred, p_tgt, p_src, valid_mask, numer)
 
         return loss_corr, log
 
@@ -402,6 +509,7 @@ class TossLoraModule(TOSS):
         d_img = None
         d_sobel = None
         corr_loss = None
+        corr_log = {}
 
         '''Correlation feature regularization'''
         if self.lambda_corr > 0.0:
@@ -478,18 +586,59 @@ class TossLoraModule(TOSS):
             wandb_log["dists_loss_img"] = d_img
             wandb_log["dists_loss_sobel"] = d_sobel
         if corr_loss is not None:
-            wandb_log["corr_loss"] = corr_loss
+            wandb_log.update(corr_log)
             wandb_log["weighted_corr_loss"] = self.lambda_corr * corr_loss
 
         '''WanDB logging'''
         if self.global_step % 50 == 0:
-            trainable = getattr(self, "_trainable_params", None) or [
-                p for p in self.parameters() if p.requires_grad
+
+            # Gradient 진단용 parameter groups
+            lora_params = [
+                p for n, p in self.model.diffusion_model.named_parameters()
+                if p.requires_grad and "lora" in n.lower()
             ]
-            wandb_log["mse_grad_norm"] = _grad_norm_l2(mse_loss, trainable)
+
+            finetune_params = [
+                p for n, p in self.model.diffusion_model.named_parameters()
+                if p.requires_grad and (
+                    "pose_net" in n
+                    or "vae_proj" in n
+                    or "base_model.model.out." in n
+                )
+            ]
+
+            corr_proj_params = [
+                p for p in self.corr_proj.parameters()
+                if p.requires_grad
+            ]
+
+            # MSE -> LoRA gradient
+            wandb_log["mse_grad_lora"] = _grad_norm_l2(
+                mse_loss, lora_params
+            )
+
             if corr_loss is not None:
                 weighted_corr = self.lambda_corr * corr_loss
-                wandb_log["corr_grad_norm"] = _grad_norm_l2(weighted_corr, trainable)
+
+                # CORR -> 각각의 parameter group gradient
+                wandb_log["corr_grad_lora"] = _grad_norm_l2(
+                    weighted_corr, lora_params
+                )
+
+                wandb_log["corr_grad_finetune"] = _grad_norm_l2(
+                    weighted_corr, finetune_params
+                )
+
+                wandb_log["corr_grad_proj"] = _grad_norm_l2(
+                    weighted_corr, corr_proj_params
+                )
+
+                # CORR이 LoRA에 주는 영향 / MSE가 LoRA에 주는 영향
+                mse_g = wandb_log["mse_grad_lora"]
+                corr_g = wandb_log["corr_grad_lora"]
+
+                wandb_log["corr_mse_grad_ratio_lora"] = (
+                    corr_g / (mse_g + 1e-12))
 
             # Generate 4 multiview predictions from a single source image
             with torch.no_grad():

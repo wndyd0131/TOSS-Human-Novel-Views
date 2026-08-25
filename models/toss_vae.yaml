@@ -105,6 +105,7 @@ model:
     finetune: True
     ucg_img: 0.05
 
+    lambda_corr: 0.1
     # Identity loss (ArcFace)
     identity_loss_weight: 0.0
     identity_t_cut: 200 # timestep threshold
