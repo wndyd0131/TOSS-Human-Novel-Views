@@ -168,3 +168,4 @@ datasets/
 copy/
 wandb/
 !datasets/scripts/
+notebooks/
