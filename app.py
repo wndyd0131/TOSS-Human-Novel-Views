@@ -238,7 +238,6 @@ def get_T_from_relative(x, y, z, pose_enc="freq")->torch.Tensor:
         (-90., 0., 0.): top view
         (90., 0., 0.): bottom view
     """
-    print("POSE_ENC:", pose_enc)
     logging.debug(pose_enc)
     if pose_enc in ["freq","identity"]:
         d_T = torch.tensor([math.radians(x), math.radians(y), z])
