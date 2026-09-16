@@ -11,6 +11,7 @@ from PIL import Image
 
 from utils.eval_metrics import ImageMetricsEvaluator
 from utils.image import preprocess_image, resize_mask
+from utils.inference import generate_batch
 from utils.pose import compute_relative_pose
 
 
@@ -153,19 +154,19 @@ def _generate_batch(
         for start in range(0, len(pose_list), chunk):
             batch = pose_list[start : start + chunk]
             if delta_pose_list is not None:
-                outs = toss.generate(
-                    image=src_input,
+                outs = generate_batch(
+                    toss,
+                    src_input,
                     prompt="",
                     delta_pose_list=batch,
                 )
             else:
-                outs = toss.generate(
-                    image=src_input,
+                outs = generate_batch(
+                    toss,
+                    src_input,
                     prompt="",
                     dy_list=batch,
                 )
-            if isinstance(outs, Image.Image):
-                outs = [outs]
             gen_pils.extend(outs)
     return gen_pils
 
@@ -198,7 +199,9 @@ def run_batch_eval(
     """
     Generate novel views per subject and evaluate with metrics_evaluator.
 
-    Requires toss.generate with ``delta_pose_list`` and ``dy_list`` batch APIs.
+    Requires a toss-like object with ``model``, ``sampler``, and ``device``
+    (e.g. notebook or ``utils.inference.TossInference``). Batch generation
+    uses ``utils.inference.generate_batch``.
 
     Reconstruction track (PSNR / LPIPS): full 3DOF ``compute_relative_pose``
     per GT view, compared against that view's GT.

@@ -7,7 +7,7 @@ from utils.eval_metrics import (
     compute_psnr,
 )
 from utils.image import normalize_mask, preprocess_image, resize_mask, to_numpy_rgb
-from utils.inference import TossInference
+from utils.inference import TossInference, generate_batch
 from utils.pose import (
     compute_relative_pose,
     pose_matrix_to_toss_format,
@@ -18,6 +18,7 @@ __all__ = [
     "BatchEvalResults",
     "ImageMetricsEvaluator",
     "TossInference",
+    "generate_batch",
     "compute_identity_similarity",
     "compute_lpips",
     "compute_metrics",
