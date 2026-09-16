@@ -170,6 +170,20 @@ class ImageMetricsEvaluator:
             )
         return self._arcface_backbone
 
+    def compute_identity_metric(
+        self,
+        pred: ImageInput,
+        reference: ImageInput,
+    ) -> float:
+        """ArcFace cosine similarity between pred and reference."""
+        return compute_identity_similarity(
+            pred,
+            reference,
+            backbone=self._get_arcface_backbone(),
+            spatial_mode=self.arcface_spatial_mode,
+            device=self.device,
+        )
+
     def compute(
         self,
         pred: ImageInput,
@@ -218,6 +232,16 @@ class ImageMetricsEvaluator:
 
         return results
 
+    def compute_metrics(
+        self,
+        pred: ImageInput,
+        target: ImageInput,
+        fg_mask: Optional[MaskInput] = None,
+        **metric_flags: bool,
+    ) -> dict[str, float]:
+        """Alias for :meth:`compute`."""
+        return self.compute(pred, target, fg_mask=fg_mask, **metric_flags)
+
 
 def compute_metrics(
     pred: ImageInput,
@@ -227,5 +251,5 @@ def compute_metrics(
     evaluator: ImageMetricsEvaluator,
     **metric_flags: bool,
 ) -> dict[str, float]:
-    """Shortcut for ImageMetricsEvaluator.compute()."""
-    return evaluator.compute(pred, target, fg_mask=fg_mask, **metric_flags)
+    """Module-level shortcut for :meth:`ImageMetricsEvaluator.compute_metrics`."""
+    return evaluator.compute_metrics(pred, target, fg_mask=fg_mask, **metric_flags)

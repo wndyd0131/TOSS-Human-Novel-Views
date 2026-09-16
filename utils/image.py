@@ -59,6 +59,23 @@ def normalize_mask(
     return mask_arr.astype(np.float32)
 
 
+def resize_mask(mask: MaskInput, size: int = 256) -> np.ndarray:
+    """Resize mask to (size, size) float32 in [0, 1]."""
+    if isinstance(mask, Image.Image):
+        mask = mask.convert("L").resize([size, size], Image.Resampling.LANCZOS)
+        return normalize_mask(mask)
+
+    mask_arr = normalize_mask(mask)
+    if mask_arr.shape == (size, size):
+        return mask_arr
+
+    mask_pil = Image.fromarray(
+        np.clip(mask_arr * 255.0, 0, 255).astype(np.uint8),
+        mode="L",
+    )
+    return normalize_mask(mask_pil.resize([size, size], Image.Resampling.LANCZOS))
+
+
 def preprocess_image(
     input_im: Image.Image,
     fg_mask: Optional[Image.Image] = None,
