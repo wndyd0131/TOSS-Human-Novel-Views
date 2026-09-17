@@ -59,6 +59,8 @@ _CSV_SUMMARY_HEADER = (
     "recon_view_indices",
     "identity_num_yaws",
 )
+_EVAL_STATE_VERSION = 1
+_EVAL_STATE_FILENAME = "eval_state.json"
 
 
 def _reconstruction_enabled(metrics_config: dict[str, bool]) -> bool:
@@ -227,6 +229,151 @@ def _mean_or_none(values: list[float]) -> float | None:
     return float(np.mean(values))
 
 
+def _parse_yaw_json_key(key: str) -> float:
+    return _yaw_key(float(key))
+
+
+def _results_to_serializable(results: BatchEvalResults) -> dict[str, Any]:
+    per_yaw: dict[str, dict[str, list[float]]] = {}
+    for metric_key, yaw_bucket in results.per_yaw.items():
+        per_yaw[metric_key] = {
+            _format_yaw_json_key(yaw): list(values)
+            for yaw, values in yaw_bucket.items()
+        }
+    return {
+        "overall": {
+            key: list(values) for key, values in results.overall.items()
+        },
+        "per_subject": {
+            subject: {key: list(values) for key, values in metrics.items()}
+            for subject, metrics in results.per_subject.items()
+        },
+        "per_yaw": per_yaw,
+    }
+
+
+def _results_from_serializable(data: dict[str, Any]) -> BatchEvalResults:
+    per_yaw = {
+        key: defaultdict(list) for key in _init_metric_buckets()
+    }
+    for metric_key in _init_metric_buckets():
+        for yaw_str, values in data.get("per_yaw", {}).get(metric_key, {}).items():
+            per_yaw[metric_key][_parse_yaw_json_key(yaw_str)] = list(values)
+
+    per_subject: dict[str, dict[str, list[float]]] = {}
+    for subject, metrics in data.get("per_subject", {}).items():
+        per_subject[str(subject)] = {
+            key: list(values) for key, values in metrics.items()
+        }
+
+    overall = _init_metric_buckets()
+    for key, values in data.get("overall", {}).items():
+        if key in overall:
+            overall[key] = list(values)
+
+    return BatchEvalResults(
+        per_yaw=per_yaw,
+        per_subject=per_subject,
+        overall=overall,
+    )
+
+
+def _normalize_eval_config(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(config)
+    recon_views = normalized.get("recon_view_indices")
+    if recon_views is not None and isinstance(recon_views, Sequence) and not isinstance(
+        recon_views, (str, bytes)
+    ):
+        normalized["recon_view_indices"] = list(recon_views)
+    metrics_config = normalized.get("metrics_config")
+    if metrics_config is not None:
+        normalized["metrics_config"] = dict(metrics_config)
+    return normalized
+
+
+def _eval_configs_match(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return json.dumps(_normalize_eval_config(left), sort_keys=True) == json.dumps(
+        _normalize_eval_config(right), sort_keys=True
+    )
+
+
+def _build_run_eval_config(
+    *,
+    src_view_idx: int,
+    recon_view_indices: Sequence[int],
+    identity_yaw_min_deg: float,
+    identity_yaw_max_deg: float,
+    identity_num_yaws: int,
+    metrics_config: dict[str, bool],
+) -> dict[str, Any]:
+    return _normalize_eval_config(
+        {
+            "src_view_idx": src_view_idx,
+            "recon_view_indices": list(recon_view_indices),
+            "identity_yaw_min_deg": identity_yaw_min_deg,
+            "identity_yaw_max_deg": identity_yaw_max_deg,
+            "identity_num_yaws": identity_num_yaws,
+            "metrics_config": dict(metrics_config),
+        }
+    )
+
+
+def _init_batch_eval_results(test_subjects: list[Any]) -> BatchEvalResults:
+    return BatchEvalResults(
+        per_yaw={key: defaultdict(list) for key in _init_metric_buckets()},
+        per_subject={
+            str(subject): _init_metric_buckets() for subject in test_subjects
+        },
+        overall=_init_metric_buckets(),
+    )
+
+
+def _ensure_subject_buckets(
+    results: BatchEvalResults,
+    test_subjects: list[Any],
+) -> None:
+    for subject in test_subjects:
+        subject = str(subject)
+        if subject not in results.per_subject:
+            results.per_subject[subject] = _init_metric_buckets()
+
+
+def save_eval_checkpoint(
+    checkpoint_dir: str | Path,
+    *,
+    results: BatchEvalResults,
+    completed_subjects: list[str],
+    checkpoint: str,
+    test_subjects: list[Any],
+    eval_config: dict[str, Any],
+) -> Path:
+    """Write rolling ``eval_state.json`` after each completed subject."""
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    state_path = checkpoint_dir / _EVAL_STATE_FILENAME
+    payload = {
+        "version": _EVAL_STATE_VERSION,
+        "checkpoint": checkpoint,
+        "eval_config": _normalize_eval_config(eval_config),
+        "test_subjects": [str(subject) for subject in test_subjects],
+        "completed_subjects": list(completed_subjects),
+        "results": _results_to_serializable(results),
+    }
+    with state_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    return state_path
+
+
+def load_eval_checkpoint(checkpoint_dir: str | Path) -> dict[str, Any] | None:
+    """Load ``eval_state.json`` if present."""
+    state_path = Path(checkpoint_dir) / _EVAL_STATE_FILENAME
+    if not state_path.exists():
+        return None
+    with state_path.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 def _aggregate_track(
     results: BatchEvalResults,
     metric_keys: Sequence[str],
@@ -313,6 +460,15 @@ def _build_eval_json_payload(
     return payload
 
 
+def _resolve_eval_timestamp(timestamp: str | None) -> tuple[str, str]:
+    """Return ISO UTC timestamp and ``YYYYMMDD_HHMM`` filename prefix."""
+    if timestamp is None:
+        now = datetime.now(timezone.utc)
+    else:
+        now = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    return now.strftime("%Y-%m-%dT%H:%M:%SZ"), now.strftime("%Y%m%d_%H%M")
+
+
 def _append_csv_summary_row(
     csv_path: Path,
     row: dict[str, Any],
@@ -333,14 +489,17 @@ def save_batch_eval_logs(
     test_subjects: list[Any],
     eval_config: dict[str, Any] | None = None,
     timestamp: str | None = None,
+    include_timestamp_in_filename: bool = True,
 ) -> dict[str, Path]:
     """
     Persist eval results for one run.
 
     Writes:
-        ``{checkpoint_stem}.json`` — full archive (recon/identity split)
-        ``{checkpoint_stem}.txt`` — human-readable summary
+        ``{YYYYMMDD_HHMM}_{checkpoint_stem}.json`` — full archive (default)
+        ``{YYYYMMDD_HHMM}_{checkpoint_stem}.txt`` — human-readable summary
         ``summary.csv`` — append one comparison row (created if missing)
+
+    Set ``include_timestamp_in_filename=False`` for ``{checkpoint_stem}.*`` only.
 
     Log files are intended for Drive/local storage, not the git repo.
     """
@@ -348,11 +507,16 @@ def save_batch_eval_logs(
     log_dir.mkdir(parents=True, exist_ok=True)
 
     eval_config = dict(eval_config or {})
-    timestamp = timestamp or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    timestamp, time_prefix = _resolve_eval_timestamp(timestamp)
     checkpoint_stem = Path(checkpoint).stem
+    run_stem = (
+        f"{time_prefix}_{checkpoint_stem}"
+        if include_timestamp_in_filename
+        else checkpoint_stem
+    )
 
-    json_path = log_dir / f"{checkpoint_stem}.json"
-    txt_path = log_dir / f"{checkpoint_stem}.txt"
+    json_path = log_dir / f"{run_stem}.json"
+    txt_path = log_dir / f"{run_stem}.txt"
     csv_path = log_dir / "summary.csv"
 
     payload = _build_eval_json_payload(
@@ -477,6 +641,11 @@ def run_batch_eval(
     eval_gen_batch_size: Optional[int] = None,
     metrics_config: Optional[dict[str, bool]] = None,
     verbose: bool = True,
+    checkpoint_dir: str | Path | None = None,
+    resume: bool = False,
+    checkpoint: str | None = None,
+    eval_config: dict[str, Any] | None = None,
+    log_dir: str | Path | None = None,
 ) -> BatchEvalResults:
     """
     Generate novel views per subject and evaluate with metrics_evaluator.
@@ -496,10 +665,69 @@ def run_batch_eval(
 
     Pred and GT are both passed through ``preprocess_image`` with the GT
     ``alpha_maps`` mask so background pixels are composited onto white equally.
+
+    Checkpointing (Colab):
+        Set ``checkpoint_dir`` and ``checkpoint`` to save ``eval_state.json`` after
+        each subject. Pass ``resume=True`` to skip completed subjects. When all
+        subjects finish, ``save_batch_eval_logs`` runs automatically into
+        ``log_dir`` (defaults to ``checkpoint_dir``). If interrupted, re-run with
+        the same args and ``resume=True``; call ``save_batch_eval_logs`` manually
+        only if you need logs without finishing all subjects.
     """
     metrics_config = metrics_config or {}
     run_reconstruction = _reconstruction_enabled(metrics_config)
     run_identity = metrics_config.get("identity", True)
+
+    run_eval_config = _build_run_eval_config(
+        src_view_idx=src_view_idx,
+        recon_view_indices=recon_view_indices,
+        identity_yaw_min_deg=identity_yaw_min_deg,
+        identity_yaw_max_deg=identity_yaw_max_deg,
+        identity_num_yaws=identity_num_yaws,
+        metrics_config=metrics_config,
+    )
+    if eval_config is not None:
+        run_eval_config.update(_normalize_eval_config(eval_config))
+
+    if checkpoint_dir is not None and not checkpoint:
+        raise ValueError("checkpoint_dir requires checkpoint name for metadata/logs")
+
+    subject_ids = [str(subject) for subject in test_subjects]
+    completed_subjects: list[str] = []
+    completed_set: set[str] = set()
+    results = _init_batch_eval_results(test_subjects)
+
+    if checkpoint_dir is not None:
+        state = load_eval_checkpoint(checkpoint_dir) if resume else None
+        if state is not None:
+            if state.get("version") != _EVAL_STATE_VERSION:
+                raise ValueError(
+                    f"unsupported eval checkpoint version: {state.get('version')}"
+                )
+            if state.get("test_subjects") != subject_ids:
+                raise ValueError(
+                    "checkpoint test_subjects mismatch; use a fresh checkpoint_dir "
+                    "or pass the same test_subjects list"
+                )
+            if not _eval_configs_match(
+                state.get("eval_config", {}),
+                run_eval_config,
+            ):
+                raise ValueError(
+                    "checkpoint eval_config mismatch; use a fresh checkpoint_dir "
+                    "or pass the same eval settings"
+                )
+            results = _results_from_serializable(state["results"])
+            completed_subjects = [str(s) for s in state.get("completed_subjects", [])]
+            completed_set = set(completed_subjects)
+            _ensure_subject_buckets(results, test_subjects)
+            if verbose:
+                print(
+                    f"Resumed checkpoint: {len(completed_subjects)}/"
+                    f"{len(subject_ids)} subjects complete"
+                )
+        elif resume and verbose:
+            print("No checkpoint found; starting fresh eval")
 
     dy_grid = identity_dy_grid(
         identity_yaw_min_deg,
@@ -507,16 +735,12 @@ def run_batch_eval(
         identity_num_yaws,
     )
 
-    results = BatchEvalResults(
-        per_yaw={key: defaultdict(list) for key in _init_metric_buckets()},
-        per_subject={
-            str(subject): _init_metric_buckets() for subject in test_subjects
-        },
-        overall=_init_metric_buckets(),
-    )
+    for subject in subject_ids:
+        if subject in completed_set:
+            if verbose:
+                print(f"subject {subject}: skip (checkpoint)")
+            continue
 
-    for subject in test_subjects:
-        subject = str(subject)
         sub_path = os.path.join(test_root, subject)
 
         poses = np.load(os.path.join(sub_path, "poses.npy")).reshape(-1, 4, 4)
@@ -624,6 +848,24 @@ def run_batch_eval(
                         f"IdSim={id_sim:.4f}"
                     )
 
+        completed_subjects.append(subject)
+        completed_set.add(subject)
+        if checkpoint_dir is not None:
+            assert checkpoint is not None
+            save_eval_checkpoint(
+                checkpoint_dir,
+                results=results,
+                completed_subjects=completed_subjects,
+                checkpoint=checkpoint,
+                test_subjects=test_subjects,
+                eval_config=run_eval_config,
+            )
+            if verbose:
+                print(
+                    f"subject {subject}: checkpoint saved "
+                    f"({len(completed_subjects)}/{len(subject_ids)})"
+                )
+
     if verbose:
         print_batch_eval_summary(
             results,
@@ -633,5 +875,22 @@ def run_batch_eval(
             identity_yaw_min_deg=identity_yaw_min_deg,
             identity_yaw_max_deg=identity_yaw_max_deg,
         )
+
+    if (
+        checkpoint_dir is not None
+        and checkpoint is not None
+        and len(completed_subjects) == len(subject_ids)
+    ):
+        log_paths = save_batch_eval_logs(
+            results,
+            log_dir or checkpoint_dir,
+            checkpoint=checkpoint,
+            test_subjects=test_subjects,
+            eval_config=run_eval_config,
+        )
+        if verbose:
+            print("\n=== Eval logs saved ===")
+            for key, path in log_paths.items():
+                print(f"{key}: {path}")
 
     return results

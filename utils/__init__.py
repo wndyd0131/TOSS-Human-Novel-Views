@@ -1,9 +1,11 @@
 from utils.batch_eval import (
     BatchEvalResults,
     format_batch_eval_summary,
+    load_eval_checkpoint,
     print_batch_eval_summary,
     run_batch_eval,
     save_batch_eval_logs,
+    save_eval_checkpoint,
 )
 from utils.eval_metrics import (
     ImageMetricsEvaluator,
@@ -36,9 +38,11 @@ __all__ = [
     "compute_psnr",
     "compute_relative_pose",
     "identity_dy_grid",
+    "load_eval_checkpoint",
     "print_batch_eval_summary",
     "run_batch_eval",
     "save_batch_eval_logs",
+    "save_eval_checkpoint",
     "normalize_mask",
     "pose_matrix_to_toss_format",
     "preprocess_image",
