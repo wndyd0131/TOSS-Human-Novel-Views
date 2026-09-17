@@ -9,13 +9,17 @@ from utils.eval_metrics import (
 from utils.image import normalize_mask, preprocess_image, resize_mask, to_numpy_rgb
 from utils.inference import TossInference, generate_batch
 from utils.pose import (
+    DEFAULT_RECON_VIEW_INDICES,
     compute_relative_pose,
+    identity_dy_grid,
     pose_matrix_to_toss_format,
     rotation_matrix_to_euler,
+    select_recon_views,
 )
 
 __all__ = [
     "BatchEvalResults",
+    "DEFAULT_RECON_VIEW_INDICES",
     "ImageMetricsEvaluator",
     "TossInference",
     "generate_batch",
@@ -24,6 +28,7 @@ __all__ = [
     "compute_metrics",
     "compute_psnr",
     "compute_relative_pose",
+    "identity_dy_grid",
     "print_batch_eval_summary",
     "run_batch_eval",
     "normalize_mask",
@@ -31,5 +36,6 @@ __all__ = [
     "preprocess_image",
     "resize_mask",
     "rotation_matrix_to_euler",
+    "select_recon_views",
     "to_numpy_rgb",
 ]

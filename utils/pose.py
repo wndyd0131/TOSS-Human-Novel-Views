@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from typing import Sequence
+
 import numpy as np
+
+DEFAULT_RECON_VIEW_INDICES = (0, 1, 2, 3, 8, 12, 13, 15)
 
 
 def rotation_matrix_to_euler(R: np.ndarray) -> tuple[float, float]:
@@ -57,3 +61,36 @@ def compute_relative_pose(
         [delta_pitch, delta_yaw, tgt_dist - src_dist],
         dtype=np.float32,
     )
+
+
+def select_recon_views(
+    num_views: int,
+    src_view_idx: int,
+    view_indices: Sequence[int] = DEFAULT_RECON_VIEW_INDICES,
+) -> list[int]:
+    """Return sorted unique view indices for recon eval, excluding source."""
+    selected: list[int] = []
+    seen: set[int] = set()
+    for view_idx in view_indices:
+        view_idx = int(view_idx)
+        if view_idx == src_view_idx:
+            continue
+        if view_idx < 0 or view_idx >= num_views:
+            continue
+        if view_idx in seen:
+            continue
+        seen.add(view_idx)
+        selected.append(view_idx)
+    return sorted(selected)
+
+
+def identity_dy_grid(
+    yaw_min: float = -22.0,
+    yaw_max: float = 22.0,
+    n: int = 45,
+) -> list[float]:
+    """Uniform yaw grid in degrees for identity eval."""
+    if n < 1:
+        raise ValueError("identity grid size must be at least 1")
+    grid = np.linspace(float(yaw_min), float(yaw_max), int(n), dtype=np.float64)
+    return [float(yaw) for yaw in grid]
