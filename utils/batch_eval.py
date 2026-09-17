@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import csv
+import json
 import os
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional, Sequence
 
 import numpy as np
@@ -38,6 +42,23 @@ def _init_metric_buckets() -> dict[str, list[float]]:
 
 
 _RECON_METRIC_KEYS = ("psnr", "fg_psnr", "lpips", "fg_lpips")
+_IDENTITY_METRIC_KEYS = ("identity",)
+
+_CSV_SUMMARY_HEADER = (
+    "timestamp",
+    "checkpoint",
+    "num_subjects",
+    "recon_n",
+    "psnr",
+    "fg_psnr",
+    "lpips",
+    "fg_lpips",
+    "identity_n",
+    "identity",
+    "src_view_idx",
+    "recon_view_indices",
+    "identity_num_yaws",
+)
 
 
 def _reconstruction_enabled(metrics_config: dict[str, bool]) -> bool:
@@ -57,6 +78,124 @@ def _yaw_key(yaw_deg: float) -> float:
     return 0.0 if key == 0 else key
 
 
+def format_batch_eval_summary(
+    results: BatchEvalResults,
+    test_subjects: list[Any],
+    *,
+    recon_view_indices: Sequence[int] = DEFAULT_RECON_VIEW_INDICES,
+    identity_num_yaws: int = 45,
+    identity_yaw_min_deg: float = -22.0,
+    identity_yaw_max_deg: float = 22.0,
+) -> str:
+    """Return the same text that ``print_batch_eval_summary`` prints."""
+    lines: list[str] = []
+    lines.append("\n=== Eval configuration ===")
+    lines.append(
+        f"Reconstruction views (GT): {list(recon_view_indices)} (source excluded)"
+    )
+    lines.append(
+        f"Identity grid: {identity_num_yaws} yaws "
+        f"from {identity_yaw_min_deg:+.1f}° to {identity_yaw_max_deg:+.1f}° vs source"
+    )
+
+    yaw_values = _sorted_yaw_keys(results.per_yaw)
+
+    if results.overall.get("psnr"):
+        lines.append("\n=== Per-yaw mean PSNR (reconstruction) ===")
+        for yaw in yaw_values:
+            if not results.per_yaw["psnr"].get(yaw):
+                continue
+            lines.append(
+                f"yaw {yaw:+.1f}°: "
+                f"Full={np.mean(results.per_yaw['psnr'][yaw]):.3f} dB | "
+                f"FG={np.mean(results.per_yaw['fg_psnr'][yaw]):.3f} dB | "
+                f"n={len(results.per_yaw['psnr'][yaw])}"
+            )
+
+        lines.append("\n=== Per-subject mean PSNR (reconstruction) ===")
+        for subject in test_subjects:
+            subject = str(subject)
+            sub = results.per_subject.get(subject, {})
+            if sub.get("psnr"):
+                lines.append(
+                    f"{subject}: "
+                    f"Full={np.mean(sub['psnr']):.3f} dB | "
+                    f"FG={np.mean(sub['fg_psnr']):.3f} dB"
+                )
+
+        lines.append(
+            f"\n=== Overall micro-average PSNR (reconstruction) ===\n"
+            f"Full image: {np.mean(results.overall['psnr']):.3f} dB "
+            f"(n={len(results.overall['psnr'])})\n"
+            f"Foreground: {np.mean(results.overall['fg_psnr']):.3f} dB "
+            f"(n={len(results.overall['fg_psnr'])})"
+        )
+
+    if results.overall.get("lpips"):
+        lines.append("\n=== Per-yaw mean LPIPS (reconstruction) ===")
+        for yaw in yaw_values:
+            if not results.per_yaw["lpips"].get(yaw):
+                continue
+            lines.append(
+                f"yaw {yaw:+.1f}°: "
+                f"Full={np.mean(results.per_yaw['lpips'][yaw]):.4f} | "
+                f"FG={np.mean(results.per_yaw['fg_lpips'][yaw]):.4f} | "
+                f"n={len(results.per_yaw['lpips'][yaw])}"
+            )
+
+        lines.append("\n=== Per-subject mean LPIPS (reconstruction) ===")
+        for subject in test_subjects:
+            subject = str(subject)
+            sub = results.per_subject.get(subject, {})
+            if sub.get("lpips"):
+                lines.append(
+                    f"{subject}: "
+                    f"Full={np.mean(sub['lpips']):.4f} | "
+                    f"FG={np.mean(sub['fg_lpips']):.4f}"
+                )
+
+        lines.append(
+            f"\n=== Overall micro-average LPIPS (reconstruction) ===\n"
+            f"Full image: {np.mean(results.overall['lpips']):.4f} "
+            f"(n={len(results.overall['lpips'])})\n"
+            f"Foreground: {np.mean(results.overall['fg_lpips']):.4f} "
+            f"(n={len(results.overall['fg_lpips'])})"
+        )
+
+    if results.overall.get("identity"):
+        lines.append(
+            "\n=== Per-yaw mean Identity Similarity vs source "
+            "(higher is better) ==="
+        )
+        for yaw in yaw_values:
+            if not results.per_yaw["identity"].get(yaw):
+                continue
+            lines.append(
+                f"yaw {yaw:+.1f}°: "
+                f"IdSim={np.mean(results.per_yaw['identity'][yaw]):.4f} | "
+                f"n={len(results.per_yaw['identity'][yaw])}"
+            )
+
+        lines.append(
+            "\n=== Per-subject mean Identity Similarity vs source "
+            "(higher is better) ==="
+        )
+        for subject in test_subjects:
+            subject = str(subject)
+            sub = results.per_subject.get(subject, {})
+            if sub.get("identity"):
+                lines.append(f"{subject}: IdSim={np.mean(sub['identity']):.4f}")
+
+        lines.append(
+            f"\n=== Overall micro-average Identity Similarity vs source "
+            f"(higher is better) ===\n"
+            f"IdSim={np.mean(results.overall['identity']):.4f} "
+            f"(n={len(results.overall['identity'])})"
+        )
+
+    return "\n".join(lines)
+
+
 def print_batch_eval_summary(
     results: BatchEvalResults,
     test_subjects: list[Any],
@@ -66,107 +205,215 @@ def print_batch_eval_summary(
     identity_yaw_min_deg: float = -22.0,
     identity_yaw_max_deg: float = 22.0,
 ) -> None:
-    print("\n=== Eval configuration ===")
-    print(f"Reconstruction views (GT): {list(recon_view_indices)} (source excluded)")
     print(
-        f"Identity grid: {identity_num_yaws} yaws "
-        f"from {identity_yaw_min_deg:+.1f}° to {identity_yaw_max_deg:+.1f}° vs source"
+        format_batch_eval_summary(
+            results,
+            test_subjects,
+            recon_view_indices=recon_view_indices,
+            identity_num_yaws=identity_num_yaws,
+            identity_yaw_min_deg=identity_yaw_min_deg,
+            identity_yaw_max_deg=identity_yaw_max_deg,
+        )
     )
 
-    yaw_values = _sorted_yaw_keys(results.per_yaw)
 
-    if results.overall.get("psnr"):
-        print("\n=== Per-yaw mean PSNR (reconstruction) ===")
-        for yaw in yaw_values:
-            if not results.per_yaw["psnr"].get(yaw):
-                continue
-            print(
-                f"yaw {yaw:+.1f}°: "
-                f"Full={np.mean(results.per_yaw['psnr'][yaw]):.3f} dB | "
-                f"FG={np.mean(results.per_yaw['fg_psnr'][yaw]):.3f} dB | "
-                f"n={len(results.per_yaw['psnr'][yaw])}"
-            )
+def _format_yaw_json_key(yaw_deg: float) -> str:
+    return f"{float(yaw_deg):+.1f}"
 
-        print("\n=== Per-subject mean PSNR (reconstruction) ===")
-        for subject in test_subjects:
-            subject = str(subject)
-            sub = results.per_subject.get(subject, {})
-            if sub.get("psnr"):
-                print(
-                    f"{subject}: "
-                    f"Full={np.mean(sub['psnr']):.3f} dB | "
-                    f"FG={np.mean(sub['fg_psnr']):.3f} dB"
-                )
 
-        print(
-            f"\n=== Overall micro-average PSNR (reconstruction) ===\n"
-            f"Full image: {np.mean(results.overall['psnr']):.3f} dB "
-            f"(n={len(results.overall['psnr'])})\n"
-            f"Foreground: {np.mean(results.overall['fg_psnr']):.3f} dB "
-            f"(n={len(results.overall['fg_psnr'])})"
-        )
+def _mean_or_none(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return float(np.mean(values))
 
-    if results.overall.get("lpips"):
-        print("\n=== Per-yaw mean LPIPS (reconstruction) ===")
-        for yaw in yaw_values:
-            if not results.per_yaw["lpips"].get(yaw):
-                continue
-            print(
-                f"yaw {yaw:+.1f}°: "
-                f"Full={np.mean(results.per_yaw['lpips'][yaw]):.4f} | "
-                f"FG={np.mean(results.per_yaw['fg_lpips'][yaw]):.4f} | "
-                f"n={len(results.per_yaw['lpips'][yaw])}"
-            )
 
-        print("\n=== Per-subject mean LPIPS (reconstruction) ===")
-        for subject in test_subjects:
-            subject = str(subject)
-            sub = results.per_subject.get(subject, {})
-            if sub.get("lpips"):
-                print(
-                    f"{subject}: "
-                    f"Full={np.mean(sub['lpips']):.4f} | "
-                    f"FG={np.mean(sub['fg_lpips']):.4f}"
-                )
+def _aggregate_track(
+    results: BatchEvalResults,
+    metric_keys: Sequence[str],
+    *,
+    aggregation: str,
+) -> dict[str, Any]:
+    overall: dict[str, float] = {}
+    for key in metric_keys:
+        values = results.overall.get(key, [])
+        if values:
+            overall[key] = float(np.mean(values))
 
-        print(
-            f"\n=== Overall micro-average LPIPS (reconstruction) ===\n"
-            f"Full image: {np.mean(results.overall['lpips']):.4f} "
-            f"(n={len(results.overall['lpips'])})\n"
-            f"Foreground: {np.mean(results.overall['fg_lpips']):.4f} "
-            f"(n={len(results.overall['fg_lpips'])})"
+    primary = metric_keys[0] if metric_keys else None
+    n_samples = len(results.overall.get(primary, [])) if primary else 0
+
+    per_subject: dict[str, Any] = {}
+    for subject, sub in results.per_subject.items():
+        entry: dict[str, Any] = {}
+        n = 0
+        for key in metric_keys:
+            values = sub.get(key, [])
+            if values:
+                entry[key] = float(np.mean(values))
+                n = len(values)
+        if entry:
+            entry["n"] = n
+            per_subject[subject] = entry
+
+    yaw_keys: set[float] = set()
+    for key in metric_keys:
+        yaw_keys.update(results.per_yaw.get(key, {}).keys())
+
+    per_yaw: dict[str, Any] = {}
+    for yaw in sorted(yaw_keys):
+        entry: dict[str, Any] = {}
+        n = 0
+        for key in metric_keys:
+            values = results.per_yaw.get(key, {}).get(yaw, [])
+            if values:
+                entry[key] = float(np.mean(values))
+                n = len(values)
+        if entry:
+            entry["n"] = n
+            per_yaw[_format_yaw_json_key(yaw)] = entry
+
+    return {
+        "aggregation": aggregation,
+        "n_samples": n_samples,
+        "overall": overall,
+        "per_subject": per_subject,
+        "per_yaw": per_yaw,
+    }
+
+
+def _build_eval_json_payload(
+    results: BatchEvalResults,
+    *,
+    checkpoint: str,
+    timestamp: str,
+    test_subjects: list[Any],
+    eval_config: dict[str, Any],
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "checkpoint": checkpoint,
+        "timestamp": timestamp,
+        "eval_config": eval_config,
+        "test_subjects": [str(subject) for subject in test_subjects],
+    }
+
+    if any(results.overall.get(key) for key in _RECON_METRIC_KEYS):
+        payload["reconstruction"] = _aggregate_track(
+            results,
+            _RECON_METRIC_KEYS,
+            aggregation="micro-average over (subject, gt_view)",
         )
 
     if results.overall.get("identity"):
-        print(
-            "\n=== Per-yaw mean Identity Similarity vs source "
-            "(higher is better) ==="
+        payload["identity"] = _aggregate_track(
+            results,
+            _IDENTITY_METRIC_KEYS,
+            aggregation="micro-average over (subject, dy_grid) vs source",
         )
-        for yaw in yaw_values:
-            if not results.per_yaw["identity"].get(yaw):
-                continue
-            print(
-                f"yaw {yaw:+.1f}°: "
-                f"IdSim={np.mean(results.per_yaw['identity'][yaw]):.4f} | "
-                f"n={len(results.per_yaw['identity'][yaw])}"
-            )
 
-        print(
-            "\n=== Per-subject mean Identity Similarity vs source "
-            "(higher is better) ==="
-        )
-        for subject in test_subjects:
-            subject = str(subject)
-            sub = results.per_subject.get(subject, {})
-            if sub.get("identity"):
-                print(f"{subject}: IdSim={np.mean(sub['identity']):.4f}")
+    return payload
 
-        print(
-            f"\n=== Overall micro-average Identity Similarity vs source "
-            f"(higher is better) ===\n"
-            f"IdSim={np.mean(results.overall['identity']):.4f} "
-            f"(n={len(results.overall['identity'])})"
-        )
+
+def _append_csv_summary_row(
+    csv_path: Path,
+    row: dict[str, Any],
+) -> None:
+    write_header = not csv_path.exists()
+    with csv_path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=_CSV_SUMMARY_HEADER)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({key: row.get(key, "") for key in _CSV_SUMMARY_HEADER})
+
+
+def save_batch_eval_logs(
+    results: BatchEvalResults,
+    log_dir: str | Path,
+    *,
+    checkpoint: str,
+    test_subjects: list[Any],
+    eval_config: dict[str, Any] | None = None,
+    timestamp: str | None = None,
+) -> dict[str, Path]:
+    """
+    Persist eval results for one run.
+
+    Writes:
+        ``{checkpoint_stem}.json`` — full archive (recon/identity split)
+        ``{checkpoint_stem}.txt`` — human-readable summary
+        ``summary.csv`` — append one comparison row (created if missing)
+
+    Log files are intended for Drive/local storage, not the git repo.
+    """
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    eval_config = dict(eval_config or {})
+    timestamp = timestamp or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    checkpoint_stem = Path(checkpoint).stem
+
+    json_path = log_dir / f"{checkpoint_stem}.json"
+    txt_path = log_dir / f"{checkpoint_stem}.txt"
+    csv_path = log_dir / "summary.csv"
+
+    payload = _build_eval_json_payload(
+        results,
+        checkpoint=checkpoint,
+        timestamp=timestamp,
+        test_subjects=test_subjects,
+        eval_config=eval_config,
+    )
+    with json_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+
+    summary_kwargs = {
+        "recon_view_indices": eval_config.get(
+            "recon_view_indices", DEFAULT_RECON_VIEW_INDICES
+        ),
+        "identity_num_yaws": eval_config.get("identity_num_yaws", 45),
+        "identity_yaw_min_deg": eval_config.get("identity_yaw_min_deg", -22.0),
+        "identity_yaw_max_deg": eval_config.get("identity_yaw_max_deg", 22.0),
+    }
+    summary_body = format_batch_eval_summary(
+        results,
+        test_subjects,
+        **summary_kwargs,
+    )
+    txt_content = (
+        f"checkpoint: {checkpoint}\n"
+        f"timestamp: {timestamp}\n"
+        f"{summary_body}\n"
+    )
+    txt_path.write_text(txt_content, encoding="utf-8")
+
+    recon_n = len(results.overall.get("psnr", []))
+    identity_n = len(results.overall.get("identity", []))
+    recon_view_indices = eval_config.get("recon_view_indices", DEFAULT_RECON_VIEW_INDICES)
+    if isinstance(recon_view_indices, Sequence) and not isinstance(
+        recon_view_indices, (str, bytes)
+    ):
+        recon_view_indices_str = json.dumps(list(recon_view_indices))
+    else:
+        recon_view_indices_str = json.dumps(recon_view_indices)
+
+    csv_row = {
+        "timestamp": timestamp,
+        "checkpoint": checkpoint,
+        "num_subjects": len(test_subjects),
+        "recon_n": recon_n,
+        "psnr": _mean_or_none(results.overall.get("psnr", [])),
+        "fg_psnr": _mean_or_none(results.overall.get("fg_psnr", [])),
+        "lpips": _mean_or_none(results.overall.get("lpips", [])),
+        "fg_lpips": _mean_or_none(results.overall.get("fg_lpips", [])),
+        "identity_n": identity_n,
+        "identity": _mean_or_none(results.overall.get("identity", [])),
+        "src_view_idx": eval_config.get("src_view_idx", ""),
+        "recon_view_indices": recon_view_indices_str,
+        "identity_num_yaws": eval_config.get("identity_num_yaws", ""),
+    }
+    _append_csv_summary_row(csv_path, csv_row)
+
+    return {"json": json_path, "txt": txt_path, "csv": csv_path}
 
 
 def _generate_batch(

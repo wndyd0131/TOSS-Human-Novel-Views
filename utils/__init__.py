@@ -1,4 +1,10 @@
-from utils.batch_eval import BatchEvalResults, print_batch_eval_summary, run_batch_eval
+from utils.batch_eval import (
+    BatchEvalResults,
+    format_batch_eval_summary,
+    print_batch_eval_summary,
+    run_batch_eval,
+    save_batch_eval_logs,
+)
 from utils.eval_metrics import (
     ImageMetricsEvaluator,
     compute_identity_similarity,
@@ -22,6 +28,7 @@ __all__ = [
     "DEFAULT_RECON_VIEW_INDICES",
     "ImageMetricsEvaluator",
     "TossInference",
+    "format_batch_eval_summary",
     "generate_batch",
     "compute_identity_similarity",
     "compute_lpips",
@@ -31,6 +38,7 @@ __all__ = [
     "identity_dy_grid",
     "print_batch_eval_summary",
     "run_batch_eval",
+    "save_batch_eval_logs",
     "normalize_mask",
     "pose_matrix_to_toss_format",
     "preprocess_image",
