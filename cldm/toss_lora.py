@@ -10,8 +10,11 @@ from datetime import datetime
 from contextlib import nullcontext
 
 import einops
+import numpy as np
+from PIL import Image
 
 from cldm.arcface_torch_wrapper import create_frozen_arcface_backbone, preprocess_arcface_input
+from utils.inference import generate_batch
 
 # CRITICAL FIX: Completely disable gradient checkpointing to fix LoRA gradient flow
 # The custom CheckpointFunction doesn't properly handle PEFT's dynamically added parameters
@@ -126,6 +129,7 @@ class TossLoraModule(TOSS):
         self._normal_estimator = None
         self._arcface_backbone = None
         self._dists_model = None
+        self._sampler = None
 
         global run
         kst = pytz.timezone("Asia/Seoul")
@@ -279,6 +283,21 @@ class TossLoraModule(TOSS):
             self._normal_estimator = DPTNormalInference(self.normal_estimator_path).to(self.device)
             print(f"[INIT] Loaded DPT-Hybrid normal estimator from {self.normal_estimator_path}")
         return self._normal_estimator
+
+    @property
+    def sampler(self):
+        """Lazy DDIM sampler for ``generate_batch`` (WandB preview)."""
+        if self._sampler is None:
+            from ldm.models.diffusion.ddim import DDIMSampler
+            self._sampler = DDIMSampler(self)
+        return self._sampler
+
+    @staticmethod
+    def _hint_tensor_to_pil(hint_tensor):
+        """Convert batch hint ``[C,H,W]`` in [0,1] to PIL RGB for inference."""
+        arr = hint_tensor.detach().cpu().permute(1, 2, 0).numpy()
+        arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+        return Image.fromarray(arr, mode="RGB")
 
     def on_save_checkpoint(self, checkpoint):
         # We override this to prevent the parent class from 
@@ -487,22 +506,21 @@ class TossLoraModule(TOSS):
         mse_loss = F.mse_loss(model_output, noise, reduction="mean")
 
         '''Masked Loss'''
-        # mask = None
         mask = batch.get("mask")  # Original mask [B, 1, 256, 256]
+        masked_mse_loss = None
 
-        # if mask is not None:
-        #     mask = mask.to(self.device)
-        #     # Soft mask: mask=1 (face) -> weight=1.0, mask=0 (background) -> weight=min_weight
-        #     soft_mask = mask * (1.0 - self.mask_min_weight) + self.mask_min_weight
+        if mask is not None:
+            mask = mask.to(self.device)
+            # Soft mask: mask=1 (face) -> weight=1.0, mask=0 (background) -> weight=min_weight
+            soft_mask = mask * (1.0 - self.mask_min_weight) + self.mask_min_weight
 
-        #     # Masked latent MSE, normalized by mask sum to avoid diluting head signal
-        #     latent_mask = F.interpolate(soft_mask, size=model_output.shape[-2:], mode="area")
-        #     masked_mse_loss = (F.mse_loss(model_output, noise, reduction="none") * latent_mask).sum() / latent_mask.sum()
+            # Masked latent MSE, normalized by mask sum to avoid diluting head signal
+            latent_mask = F.interpolate(soft_mask, size=model_output.shape[-2:], mode="area")
+            masked_mse_loss = (F.mse_loss(model_output, noise, reduction="none") * latent_mask).sum() / latent_mask.sum()
 
-        #     loss = self.mse_weight * masked_mse_loss
-        #     print(f"MASKED LOSS: mse={masked_mse_loss.item():.4f}")
-        # else:
-        loss = mse_loss
+            loss = self.mse_weight * masked_mse_loss
+        else:
+            loss = mse_loss
 
         identity_loss = None
         dists_loss = None
@@ -575,10 +593,14 @@ class TossLoraModule(TOSS):
                         dists_loss = d_img + d_sobel
                         loss = loss + self.dists_loss_weight * dists_loss
 
+        mse_for_grad = masked_mse_loss if masked_mse_loss is not None else mse_loss
+
         wandb_log = {
             "loss": loss,
-            "mse_loss": mse_loss
+            "mse_loss": mse_loss,
         }
+        if masked_mse_loss is not None:
+            wandb_log["masked_mse_loss"] = masked_mse_loss
         if identity_loss is not None:
             wandb_log["identity_loss"] = identity_loss
         if dists_loss is not None:
@@ -612,9 +634,9 @@ class TossLoraModule(TOSS):
                 if p.requires_grad
             ]
 
-            # MSE -> LoRA gradient
+            # MSE -> LoRA gradient (uses masked MSE when enabled)
             wandb_log["mse_grad_lora"] = _grad_norm_l2(
-                mse_loss, lora_params
+                mse_for_grad, lora_params
             )
 
             if corr_loss is not None:
@@ -640,96 +662,78 @@ class TossLoraModule(TOSS):
                 wandb_log["corr_mse_grad_ratio_lora"] = (
                     corr_g / (mse_g + 1e-12))
 
-            # Generate 4 multiview predictions from a single source image
+            # Generate 4 multiview predictions (same pipeline as generate_batch)
+            source_img = batch[self.control_key][:1].to(self.device)
+            if source_img.ndim == 4 and source_img.shape[-1] == 3:
+                source_img = source_img.permute(0, 3, 1, 2)
+            source_img_display = torch.clamp(source_img, 0, 1)
+            src_pil = self._hint_tensor_to_pil(source_img_display[0])
+
+            yaw_angles_deg = [-15, -5, 5, 15]
+            wandb_images = []
+            normal_gt_and_preds = []
+
+            wandb_images.append(wandb.Image(
+                source_img_display[0],
+                caption=f"Step {self.global_step} | SOURCE",
+            ))
+
+            if "normal" in batch and "normal_mask" in batch:
+                gt_n = batch["normal"][:1].to(self.device)
+                vis_gt = _normal_to_rgb_vis(gt_n)
+                normal_gt_and_preds.append(
+                    wandb.Image(
+                        vis_gt,
+                        caption=f"Step {self.global_step} | GT normal (target view)",
+                    )
+                )
+
+                nm = batch["normal_mask"][:1].to(self.device).float()
+                if nm.ndim == 4:
+                    nm = nm[0]
+                m = nm[0] if nm.ndim == 3 else nm
+                m = torch.clamp(m, 0, 1)
+                m_vis = m.unsqueeze(0).expand(3, -1, -1)
+                normal_gt_and_preds.append(
+                    wandb.Image(
+                        m_vis,
+                        caption=f"Step {self.global_step} | GT normal_mask",
+                    )
+                )
+
+            was_training = self.training
+            self.eval()
             with torch.no_grad():
-                import math
-                
-                # Get one source image from batch
-                source_img = batch[self.control_key][:1].to(self.device)  # [1, C, H, W]
-                if source_img.ndim == 4 and source_img.shape[-1] == 3:
-                    source_img = source_img.permute(0, 3, 1, 2)
-                source_img_display = torch.clamp(source_img, 0, 1)
-                
-                # Encode source image to latent
-                source_latent = self.encode_first_stage(source_img * 2 - 1).mode().detach()
-                
-                # Get text conditioning (empty)
-                c_text = self.get_learned_conditioning([""])
-                
-                # Define 4 different yaw angles for multiview (in radians)
-                # e.g., -15°, -5°, +5°, +15°
-                yaw_angles_deg = [-15, -5, 5, 15]
-                
-                wandb_images = []
-                normal_gt_and_preds = []
-                
-                wandb_images.append(wandb.Image( # Add source image first
-                    source_img_display[0],
-                    caption=f"Step {self.global_step} | SOURCE"
+                gen_pils = generate_batch(
+                    self,
+                    src_pil,
+                    dy_list=yaw_angles_deg,
+                    h=256,
+                    w=256,
+                    ddim_steps=30,
+                    ddim_eta=0.0,
+                    prompt_scale=1.0,
+                    img_scale=3.0,
+                    img_ucg=0.05,
+                    precision="autocast",
+                    use_ema_scope=False,
+                )
+            if was_training:
+                self.train()
+                self.model.diffusion_model.train()
+
+            for yaw_deg, gen_pil in zip(yaw_angles_deg, gen_pils):
+                gen_np = np.asarray(gen_pil.convert("RGB"), dtype=np.float32) / 255.0
+                gen_tensor = torch.from_numpy(gen_np).permute(2, 0, 1)
+                wandb_images.append(wandb.Image(
+                    gen_tensor,
+                    caption=f"Step {self.global_step} | Yaw: {yaw_deg}°",
                 ))
 
-                if "normal" in batch and "normal_mask" in batch:
-                    gt_n = batch["normal"][:1].to(self.device)
-                    vis_gt = _normal_to_rgb_vis(gt_n)
-                    normal_gt_and_preds.append(
-                        wandb.Image(
-                            vis_gt,
-                            caption=f"Step {self.global_step} | GT normal (target view)",
-                        )
-                    )
-
-                    nm = batch["normal_mask"][:1].to(self.device).float()
-                    if nm.ndim == 4:
-                        nm = nm[0]
-                    m = nm[0] if nm.ndim == 3 else nm
-                    m = torch.clamp(m, 0, 1)
-                    m_vis = m.unsqueeze(0).expand(3, -1, -1)
-                    normal_gt_and_preds.append(
-                        wandb.Image(
-                            m_vis,
-                            caption=f"Step {self.global_step} | GT normal_mask",
-                        )
-                    )
-                
-                # Generate prediction for each pose
-                for yaw_deg in yaw_angles_deg:
-                    yaw_rad = math.radians(yaw_deg)
-                    delta_pose_mv = torch.tensor([[0.0, yaw_rad, 0.0]], device=self.device) # Create pose: [pitch, yaw, distance]
-                    
-                    cond_mv = { # Create conditioning dict for this pose
-                        'c_crossattn': [c_text],
-                        'c_concat': [source_img],
-                        'in_concat': [source_latent],
-                        'delta_pose': delta_pose_mv
-                    }
-                    
-                    from ldm.models.diffusion.ddim import DDIMSampler # Sample using DDIM for faster inference
-                    sampler = DDIMSampler(self)
-                    
-                    shape = [4, source_img.shape[2] // 8, source_img.shape[3] // 8]
-                    
-                    samples, _ = sampler.sample( # Use fewer steps for visualization (faster)
-                        S=20,  # Quick sampling
-                        batch_size=1,
-                        shape=shape,
-                        conditioning=cond_mv,
-                        verbose=False,
-                        unconditional_guidance_scale=1.0,
-                        eta=0.0
-                    )
-                    
-                    pred_img = self.decode_first_stage(samples) # Decode to image
-                    pred_img = torch.clamp((pred_img + 1) / 2, 0, 1)
-                    
-                    wandb_images.append(wandb.Image(
-                        pred_img[0],
-                        caption=f"Step {self.global_step} | Yaw: {yaw_deg}°"
-                    ))
-                
-                wandb_log["multiview_predictions"] = wandb_images
-                if normal_gt_and_preds:
-                    wandb_log["normal_gt_and_preds"] = normal_gt_and_preds
-                print(f"[VIS] Logged multiview (+ normals) at step {self.global_step}")
+            wandb_log["multiview_predictions"] = wandb_images
+            if normal_gt_and_preds:
+                wandb_log["normal_gt_and_preds"] = normal_gt_and_preds
+            print(f"[VIS] Logged multiview (+ normals) at step {self.global_step}")
 
         print(f"LOSS logged: total={loss.item():.4f}")
         run.log(wandb_log, step=int(self.global_step))
