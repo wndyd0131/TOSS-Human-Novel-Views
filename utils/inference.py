@@ -47,6 +47,18 @@ def _tensor_from_pose(pose: Sequence[float]) -> torch.Tensor:
     return torch.tensor(list(pose), dtype=torch.float32)
 
 
+def _resolve_pl_module(toss):
+    """Return the module that exposes TOSS sampling APIs (encode/decode/conditioning).
+
+    ``TossInference.model`` is already the Lightning module, while a
+    ``LightningModule`` passed directly (e.g. ``TossLoraModule`` during training)
+    must be used as-is — ``toss.model`` is only the inner ``DiffusionWrapper``.
+    """
+    if hasattr(toss, "get_unconditional_conditioning"):
+        return toss
+    return toss.model
+
+
 def _resolve_generate_defaults(
     toss,
     *,
@@ -93,9 +105,10 @@ def _sample_one_on_toss(
     img_scale: float,
     img_ucg: float,
 ) -> Image.Image:
+    pl_module = _resolve_pl_module(toss)
     x_samples = sample_model(
         cond_im,
-        toss.model,
+        pl_module,
         toss.sampler,
         precision=precision,
         h=h,
