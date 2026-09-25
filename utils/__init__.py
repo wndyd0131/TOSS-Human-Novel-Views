@@ -24,11 +24,13 @@ from utils.pose import (
     rotation_matrix_to_euler,
     select_recon_views,
 )
+from utils.toss_human_dataset import TossHumanDataset
 
 __all__ = [
     "BatchEvalResults",
     "DEFAULT_RECON_VIEW_INDICES",
     "ImageMetricsEvaluator",
+    "TossHumanDataset",
     "TossInference",
     "format_batch_eval_summary",
     "generate_batch",
