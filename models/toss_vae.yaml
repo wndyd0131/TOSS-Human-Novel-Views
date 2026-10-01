@@ -107,11 +107,11 @@ model:
 
     lambda_corr: 0.1
     corr_flow_src_size: 32
-    
+
     # Identity loss (ArcFace)
     identity_loss_weight: 0.0
     identity_t_cut: 200 # timestep threshold
-    arcface_ckpt_path: "content/drive/MyDrive/checkpoints/ms1mv3_arcface_r100_fp16.pth"
+    arcface_ckpt_path: "/workspace/checkpoints/ms1mv3_arcface_r100_fp16.pth"
     arcface_spatial_mode: "cover_center" # RGB 이미지를 112×112로 맞추는 방식
 
     # Geometry loss (frozen DPT-Hybrid normal estimator)
