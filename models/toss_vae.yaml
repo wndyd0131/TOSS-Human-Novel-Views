@@ -106,6 +106,8 @@ model:
     ucg_img: 0.05
 
     lambda_corr: 0.1
+    corr_flow_src_size: 32
+    
     # Identity loss (ArcFace)
     identity_loss_weight: 0.0
     identity_t_cut: 200 # timestep threshold

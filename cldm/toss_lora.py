@@ -1,5 +1,7 @@
+import math
 import torch
 from cldm.toss import TOSS
+from ldm.models.diffusion.ddim import DDIMSampler
 from peft import get_peft_model, LoraConfig
 import torch.nn.functional as F
 from torch import nn
@@ -14,8 +16,6 @@ import numpy as np
 from PIL import Image
 
 from cldm.arcface_torch_wrapper import create_frozen_arcface_backbone, preprocess_arcface_input
-from utils.inference import generate_batch
-
 # CRITICAL FIX: Completely disable gradient checkpointing to fix LoRA gradient flow
 # The custom CheckpointFunction doesn't properly handle PEFT's dynamically added parameters
 import ldm.modules.diffusionmodules.util as ldm_util
@@ -99,6 +99,11 @@ class TossLoraModule(TOSS):
         corr_proj_trainable=True,
         corr_debug_steps=200,
         corr_flow_src_size=512,
+        vis_every_n_steps=50,
+        vis_yaws_deg=(-15, -5, 5, 15),
+        vis_ddim_steps=30,
+        vis_img_scale=3.0,
+        vis_seed=0,
         **kwargs,
     ):
         kwargs.pop("lora_config_params", None)  # consumed by us
@@ -125,11 +130,20 @@ class TossLoraModule(TOSS):
         else:
             self.corr_flow_src_size = (int(src_size[0]), int(src_size[1]))
         self._corr_flow_warned = False
+        # Training-time multiview visualization (defaults match utils.inference.generate_batch)
+        self.vis_every_n_steps = int(kwargs.pop("vis_every_n_steps", vis_every_n_steps))
+        self.vis_yaws_deg = [float(y) for y in kwargs.pop("vis_yaws_deg", vis_yaws_deg)]
+        self.vis_ddim_steps = int(kwargs.pop("vis_ddim_steps", vis_ddim_steps))
+        self.vis_img_scale = float(kwargs.pop("vis_img_scale", vis_img_scale))
+        self.vis_seed = int(kwargs.pop("vis_seed", vis_seed))
         super().__init__(*args, **kwargs)
         self._normal_estimator = None
         self._arcface_backbone = None
         self._dists_model = None
         self._sampler = None
+        # Plain attributes (not buffers) so they are never written into checkpoints.
+        self._vis_sources = None
+        self._vis_names = None
 
         global run
         kst = pytz.timezone("Asia/Seoul")
@@ -484,6 +498,107 @@ class TossLoraModule(TOSS):
 
         return loss_corr, log
 
+    def set_vis_sources(self, images, names=None):
+        """Fix the source faces used for training-time multiview visualization.
+
+        images: [N, 3, H, W] (or [N, H, W, 3]) in [0, 1], same layout as the dataset's "hint".
+        """
+        if images.ndim == 4 and images.shape[-1] == 3:
+            images = einops.rearrange(images, "b h w c -> b c h w")
+        self._vis_sources = images.detach().float().cpu().clone()
+        self._vis_names = list(names) if names is not None else [str(i) for i in range(images.shape[0])]
+        print(f"[VIS] Fixed {len(self._vis_names)} visualization source(s): {self._vis_names}")
+
+    def _log_multiview_vis(self, batch, wandb_log):
+        """Sample fixed sources at ``vis_yaws_deg`` with eval-matched settings and add them to ``wandb_log``."""
+        if self._vis_sources is None:
+            src = batch[self.control_key][:1]
+            self.set_vis_sources(src, names=[str(batch["subject_id"][0])] if "subject_id" in batch else None)
+            print("[VIS][WARN] set_vis_sources() was not called; using the first training source for all steps.")
+
+        step = int(self.global_step)
+        n_yaw = len(self.vis_yaws_deg)
+        delta_pose = torch.tensor(
+            [[0.0, math.radians(y), 0.0] for y in self.vis_yaws_deg], device=self.device
+        )
+        sampler = self.sampler
+        unet = self.model.diffusion_model
+        was_training = unet.training
+        unet.eval()
+        try:
+            with torch.no_grad():
+                c_text = self.get_learned_conditioning([""] * n_yaw)
+                wandb_images = []
+                for src, name in zip(self._vis_sources, self._vis_names):
+                    src = src.unsqueeze(0).to(self.device)
+                    src_latent = self.encode_first_stage(src * 2 - 1).mode().detach()
+                    src_rep = src.repeat(n_yaw, 1, 1, 1)
+                    lat_rep = src_latent.repeat(n_yaw, 1, 1, 1)
+                    cond = {
+                        "c_crossattn": [c_text],
+                        "c_concat": [src_rep],
+                        "in_concat": [lat_rep],
+                        "delta_pose": delta_pose,
+                    }
+                    uc = {
+                        "c_crossattn": [c_text],
+                        "c_concat": [src_rep],
+                        "in_concat": [lat_rep * 0],
+                        "delta_pose": delta_pose,
+                    }
+                    # Same initial noise for every source, step, and yaw -> differences come only from the model.
+                    gen = torch.Generator(device=self.device).manual_seed(self.vis_seed)
+                    x_T = torch.randn(
+                        (1, *src_latent.shape[1:]), generator=gen, device=self.device
+                    ).repeat(n_yaw, 1, 1, 1)
+
+                    samples, _ = sampler.sample(
+                        S=self.vis_ddim_steps,
+                        batch_size=n_yaw,
+                        shape=list(src_latent.shape[1:]),
+                        conditioning=cond,
+                        verbose=False,
+                        x_T=x_T,
+                        unconditional_guidance_scale=self.vis_img_scale,
+                        unconditional_conditioning=uc,
+                        eta=0.0,
+                    )
+                    preds = torch.clamp((self.decode_first_stage(samples) + 1) / 2, 0, 1)
+
+                    wandb_images.append(wandb.Image(
+                        torch.clamp(src[0], 0, 1),
+                        caption=f"Step {step} | {name} | SOURCE",
+                    ))
+                    for yaw_deg, pred in zip(self.vis_yaws_deg, preds):
+                        wandb_images.append(wandb.Image(
+                            pred,
+                            caption=f"Step {step} | {name} | Yaw: {yaw_deg:g}° | cfg={self.vis_img_scale:g}",
+                        ))
+
+                normal_gt_and_preds = []
+                if "normal" in batch and "normal_mask" in batch:
+                    gt_n = batch["normal"][:1].to(self.device)
+                    normal_gt_and_preds.append(wandb.Image(
+                        _normal_to_rgb_vis(gt_n),
+                        caption=f"Step {step} | GT normal (target view)",
+                    ))
+                    nm = batch["normal_mask"][:1].to(self.device).float()
+                    if nm.ndim == 4:
+                        nm = nm[0]
+                    m = nm[0] if nm.ndim == 3 else nm
+                    m_vis = torch.clamp(m, 0, 1).unsqueeze(0).expand(3, -1, -1)
+                    normal_gt_and_preds.append(wandb.Image(
+                        m_vis,
+                        caption=f"Step {step} | GT normal_mask",
+                    ))
+        finally:
+            unet.train(was_training)
+
+        wandb_log["multiview_predictions"] = wandb_images
+        if normal_gt_and_preds:
+            wandb_log["normal_gt_and_preds"] = normal_gt_and_preds
+        print(f"[VIS] Logged multiview (+ normals) at step {step}")
+
     def training_step(self, batch, batch_idx):
 
         # Ensure model is in training mode
@@ -662,78 +777,8 @@ class TossLoraModule(TOSS):
                 wandb_log["corr_mse_grad_ratio_lora"] = (
                     corr_g / (mse_g + 1e-12))
 
-            # Generate 4 multiview predictions (same pipeline as generate_batch)
-            source_img = batch[self.control_key][:1].to(self.device)
-            if source_img.ndim == 4 and source_img.shape[-1] == 3:
-                source_img = source_img.permute(0, 3, 1, 2)
-            source_img_display = torch.clamp(source_img, 0, 1)
-            src_pil = self._hint_tensor_to_pil(source_img_display[0])
-
-            yaw_angles_deg = [-15, -5, 5, 15]
-            wandb_images = []
-            normal_gt_and_preds = []
-
-            wandb_images.append(wandb.Image(
-                source_img_display[0],
-                caption=f"Step {self.global_step} | SOURCE",
-            ))
-
-            if "normal" in batch and "normal_mask" in batch:
-                gt_n = batch["normal"][:1].to(self.device)
-                vis_gt = _normal_to_rgb_vis(gt_n)
-                normal_gt_and_preds.append(
-                    wandb.Image(
-                        vis_gt,
-                        caption=f"Step {self.global_step} | GT normal (target view)",
-                    )
-                )
-
-                nm = batch["normal_mask"][:1].to(self.device).float()
-                if nm.ndim == 4:
-                    nm = nm[0]
-                m = nm[0] if nm.ndim == 3 else nm
-                m = torch.clamp(m, 0, 1)
-                m_vis = m.unsqueeze(0).expand(3, -1, -1)
-                normal_gt_and_preds.append(
-                    wandb.Image(
-                        m_vis,
-                        caption=f"Step {self.global_step} | GT normal_mask",
-                    )
-                )
-
-            was_training = self.training
-            self.eval()
-            with torch.no_grad():
-                gen_pils = generate_batch(
-                    self,
-                    src_pil,
-                    dy_list=yaw_angles_deg,
-                    h=256,
-                    w=256,
-                    ddim_steps=30,
-                    ddim_eta=0.0,
-                    prompt_scale=1.0,
-                    img_scale=3.0,
-                    img_ucg=0.05,
-                    precision="autocast",
-                    use_ema_scope=False,
-                )
-            if was_training:
-                self.train()
-                self.model.diffusion_model.train()
-
-            for yaw_deg, gen_pil in zip(yaw_angles_deg, gen_pils):
-                gen_np = np.asarray(gen_pil.convert("RGB"), dtype=np.float32) / 255.0
-                gen_tensor = torch.from_numpy(gen_np).permute(2, 0, 1)
-                wandb_images.append(wandb.Image(
-                    gen_tensor,
-                    caption=f"Step {self.global_step} | Yaw: {yaw_deg}°",
-                ))
-
-            wandb_log["multiview_predictions"] = wandb_images
-            if normal_gt_and_preds:
-                wandb_log["normal_gt_and_preds"] = normal_gt_and_preds
-            print(f"[VIS] Logged multiview (+ normals) at step {self.global_step}")
+        if self.vis_every_n_steps > 0 and self.global_step % self.vis_every_n_steps == 0:
+            self._log_multiview_vis(batch, wandb_log)
 
         print(f"LOSS logged: total={loss.item():.4f}")
         run.log(wandb_log, step=int(self.global_step))
