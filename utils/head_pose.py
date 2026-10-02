@@ -10,15 +10,52 @@ from utils.image import ImageInput, to_numpy_rgb
 from utils.pose import compute_relative_pose
 
 
+_SIXDREPNET_MODULE_NAMES = (
+    "model",
+    "regressor",
+    "datasets",
+    "loss",
+    "backbone",
+    "backbone.repvgg",
+    "backbone.se_block",
+)
+
+
+def _sixdrepnet_model_module():
+    import sys
+
+    return sys.modules.get("model") or sys.modules.get("sixdrepnet.model")
+
+
+def _patch_sixdrepnet_utils(sixdrepnet_utils: Any) -> None:
+    import sys
+
+    for module_name in (
+        *_SIXDREPNET_MODULE_NAMES,
+        "sixdrepnet.model",
+        "sixdrepnet.regressor",
+        "sixdrepnet.datasets",
+    ):
+        module = sys.modules.get(module_name)
+        if module is not None and hasattr(module, "utils"):
+            module.utils = sixdrepnet_utils
+
+
+def _sixdrepnet_utils_bound() -> bool:
+    model_module = _sixdrepnet_model_module()
+    return model_module is not None and hasattr(
+        model_module.utils, "compute_rotation_matrix_from_ortho6d"
+    )
+
+
 def _import_sixdrepnet():
     """
     Import SixDRepNet without resolving ``import utils`` to this repo.
 
-    sixdrepnet uses bare ``import utils`` (see 6DRepNet#53). Because this
-    project also has a top-level ``utils`` package on ``sys.path``, simply
-    evicting ``sys.modules`` is not enough: Python would re-import our package
-    from disk. Bind ``sixdrepnet.utils`` as ``utils`` before loading sixdrepnet
-    submodules and patch their module-level ``utils`` references explicitly.
+    sixdrepnet uses bare ``import utils`` / ``from model import ...`` (see
+    6DRepNet#53). Because this project also has a top-level ``utils`` package
+    on ``sys.path``, bind ``sixdrepnet.utils`` as ``utils`` before loading
+    sixdrepnet and patch both ``model`` and ``sixdrepnet.*`` module bindings.
     """
     import importlib
     import sys
@@ -32,7 +69,7 @@ def _import_sixdrepnet():
         del sys.modules[name]
 
     for name in list(sys.modules):
-        if name.startswith("sixdrepnet"):
+        if name.startswith("sixdrepnet") or name in _SIXDREPNET_MODULE_NAMES:
             del sys.modules[name]
 
     sixdrepnet_utils = importlib.import_module("sixdrepnet.utils")
@@ -40,15 +77,9 @@ def _import_sixdrepnet():
 
     try:
         sixdrepnet_pkg = importlib.import_module("sixdrepnet")
-        for module_name in ("sixdrepnet.model", "sixdrepnet.regressor"):
-            module = sys.modules.get(module_name)
-            if module is not None:
-                module.utils = sixdrepnet_utils
+        _patch_sixdrepnet_utils(sixdrepnet_utils)
 
-        model_module = sys.modules.get("sixdrepnet.model")
-        if model_module is None or not hasattr(
-            model_module.utils, "compute_rotation_matrix_from_ortho6d"
-        ):
+        if not _sixdrepnet_utils_bound():
             raise RuntimeError(
                 "Failed to bind sixdrepnet.utils; restart the runtime and retry."
             )
@@ -84,14 +115,8 @@ class HeadPoseEstimator:
         self._model: Any = None
 
     def _get_model(self) -> Any:
-        if self._model is not None:
-            import sys
-
-            model_module = sys.modules.get("sixdrepnet.model")
-            if model_module is None or not hasattr(
-                model_module.utils, "compute_rotation_matrix_from_ortho6d"
-            ):
-                self._model = None
+        if self._model is not None and not _sixdrepnet_utils_bound():
+            self._model = None
 
         if self._model is None:
             SixDRepNet = _import_sixdrepnet()
