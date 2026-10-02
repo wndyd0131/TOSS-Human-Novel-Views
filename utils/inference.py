@@ -11,7 +11,7 @@ from einops import rearrange
 from omegaconf import OmegaConf
 from PIL import Image
 from pytorch_lightning import seed_everything
-from torch.cuda.amp import autocast
+from torch import autocast
 from torchvision import transforms
 
 from app import get_T_from_relative, load_model

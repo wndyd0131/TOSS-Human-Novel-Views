@@ -10,6 +10,34 @@ from utils.image import ImageInput, to_numpy_rgb
 from utils.pose import compute_relative_pose
 
 
+def _import_sixdrepnet():
+    """
+    Import SixDRepNet without shadowing its internal ``utils`` module.
+
+    sixdrepnet uses bare ``import utils`` (see 6DRepNet#53). This repo also
+    has a top-level ``utils`` package, so we temporarily evict it from
+    ``sys.modules`` and reload sixdrepnet if it was imported with the wrong
+    ``utils`` binding.
+    """
+    import sys
+
+    project_utils = {}
+    for name in list(sys.modules):
+        if name == "utils" or name.startswith("utils."):
+            project_utils[name] = sys.modules.pop(name)
+
+    for name in list(sys.modules):
+        if name.startswith("sixdrepnet"):
+            del sys.modules[name]
+
+    try:
+        from sixdrepnet import SixDRepNet
+
+        return SixDRepNet
+    finally:
+        sys.modules.update(project_utils)
+
+
 @dataclass
 class PoseCalibrationStats:
     mae_deg: float
@@ -35,8 +63,7 @@ class HeadPoseEstimator:
 
     def _get_model(self) -> Any:
         if self._model is None:
-            from sixdrepnet import SixDRepNet
-
+            SixDRepNet = _import_sixdrepnet()
             self._model = SixDRepNet(gpu_id=self.gpu_id)
         return self._model
 
