@@ -14,12 +14,19 @@ import torch
 from PIL import Image
 
 from utils.eval_metrics import ImageMetricsEvaluator
+from utils.head_pose import (
+    HeadPoseEstimator,
+    calibrate_pose_estimator_on_gt,
+    compute_pose_errors,
+)
 from utils.image import preprocess_image, resize_mask
 from utils.inference import generate_batch
+from utils.multiview_metrics import MultiviewMetricsEvaluator
 from utils.pose import (
     DEFAULT_RECON_VIEW_INDICES,
     compute_relative_pose,
     identity_dy_grid,
+    select_horizontal_views,
     select_recon_views,
 )
 
@@ -29,6 +36,7 @@ class BatchEvalResults:
     per_yaw: dict[str, dict[float, list[float]]] = field(default_factory=dict)
     per_subject: dict[str, dict[str, list[float]]] = field(default_factory=dict)
     overall: dict[str, list[float]] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def _init_metric_buckets() -> dict[str, list[float]]:
@@ -38,11 +46,17 @@ def _init_metric_buckets() -> dict[str, list[float]]:
         "lpips": [],
         "fg_lpips": [],
         "identity": [],
+        "mv_warp_error": [],
+        "gt_mv_warp_error": [],
+        "pose_yaw_error": [],
+        "pose_pitch_leak": [],
     }
 
 
 _RECON_METRIC_KEYS = ("psnr", "fg_psnr", "lpips", "fg_lpips")
 _IDENTITY_METRIC_KEYS = ("identity",)
+_MV_METRIC_KEYS = ("mv_warp_error", "gt_mv_warp_error")
+_POSE_METRIC_KEYS = ("pose_yaw_error", "pose_pitch_leak")
 
 _CSV_SUMMARY_HEADER = (
     "timestamp",
@@ -55,11 +69,15 @@ _CSV_SUMMARY_HEADER = (
     "fg_lpips",
     "identity_n",
     "identity",
+    "mv_warp_error",
+    "gt_mv_warp_error",
+    "pose_yaw_error",
+    "pose_pitch_leak",
     "src_view_idx",
     "recon_view_indices",
     "identity_num_yaws",
 )
-_EVAL_STATE_VERSION = 1
+_EVAL_STATE_VERSION = 2
 _EVAL_STATE_FILENAME = "eval_state.json"
 
 
@@ -68,7 +86,17 @@ def _reconstruction_enabled(metrics_config: dict[str, bool]) -> bool:
 
 
 def _sorted_yaw_keys(per_yaw: dict[str, dict[float, list[float]]]) -> list[float]:
-    for key in ("lpips", "psnr", "identity", "fg_lpips", "fg_psnr"):
+    for key in (
+        "lpips",
+        "psnr",
+        "identity",
+        "pose_yaw_error",
+        "pose_pitch_leak",
+        "fg_lpips",
+        "fg_psnr",
+        "mv_warp_error",
+        "gt_mv_warp_error",
+    ):
         bucket = per_yaw.get(key)
         if bucket:
             return sorted(bucket.keys())
@@ -195,6 +223,64 @@ def format_batch_eval_summary(
             f"(n={len(results.overall['identity'])})"
         )
 
+    if results.overall.get("mv_warp_error"):
+        lines.append(
+            "\n=== Per-pair mean Multiview warp error (lower is better) ==="
+        )
+        for yaw in _sorted_yaw_keys(results.per_yaw):
+            if not results.per_yaw["mv_warp_error"].get(yaw):
+                continue
+            gt_vals = results.per_yaw["gt_mv_warp_error"].get(yaw, [])
+            gt_mean = np.mean(gt_vals) if gt_vals else float("nan")
+            pred_mean = np.mean(results.per_yaw["mv_warp_error"][yaw])
+            ratio = pred_mean / gt_mean if gt_vals and gt_mean > 0 else float("nan")
+            lines.append(
+                f"pair left yaw {yaw:+.1f}°: "
+                f"pred={pred_mean:.4f} | GT ref={gt_mean:.4f} | "
+                f"ratio={ratio:.3f} | n={len(results.per_yaw['mv_warp_error'][yaw])}"
+            )
+        lines.append(
+            f"\n=== Overall micro-average Multiview warp error ===\n"
+            f"pred={np.mean(results.overall['mv_warp_error']):.4f} "
+            f"(n={len(results.overall['mv_warp_error'])})"
+        )
+        if results.overall.get("gt_mv_warp_error"):
+            lines.append(
+                f"GT reference={np.mean(results.overall['gt_mv_warp_error']):.4f} "
+                f"(n={len(results.overall['gt_mv_warp_error'])})"
+            )
+
+    if results.overall.get("pose_yaw_error"):
+        lines.append(
+            "\n=== Per-yaw mean Pose yaw error (lower is better) ==="
+        )
+        for yaw in yaw_values:
+            if not results.per_yaw["pose_yaw_error"].get(yaw):
+                continue
+            lines.append(
+                f"yaw {yaw:+.1f}°: "
+                f"yaw_err={np.mean(results.per_yaw['pose_yaw_error'][yaw]):.2f}° | "
+                f"pitch_leak={np.mean(results.per_yaw['pose_pitch_leak'][yaw]):.2f}° | "
+                f"n={len(results.per_yaw['pose_yaw_error'][yaw])}"
+            )
+        lines.append(
+            f"\n=== Overall micro-average Pose errors ===\n"
+            f"yaw_err={np.mean(results.overall['pose_yaw_error']):.2f}° "
+            f"(n={len(results.overall['pose_yaw_error'])})\n"
+            f"pitch_leak={np.mean(results.overall['pose_pitch_leak']):.2f}° "
+            f"(n={len(results.overall['pose_pitch_leak'])})"
+        )
+
+    if results.metadata.get("pose_estimator_gt_mae_deg") is not None:
+        lines.append(
+            "\n=== Pose estimator GT calibration (reference) ==="
+        )
+        lines.append(
+            f"GT MAE={results.metadata['pose_estimator_gt_mae_deg']:.2f}° | "
+            f"slope={results.metadata.get('pose_estimator_gt_slope', float('nan')):.3f} | "
+            f"n={results.metadata.get('pose_estimator_gt_n', 0)}"
+        )
+
     return "\n".join(lines)
 
 
@@ -249,6 +335,7 @@ def _results_to_serializable(results: BatchEvalResults) -> dict[str, Any]:
             for subject, metrics in results.per_subject.items()
         },
         "per_yaw": per_yaw,
+        "metadata": dict(results.metadata),
     }
 
 
@@ -275,6 +362,7 @@ def _results_from_serializable(data: dict[str, Any]) -> BatchEvalResults:
         per_yaw=per_yaw,
         per_subject=per_subject,
         overall=overall,
+        metadata=dict(data.get("metadata", {})),
     )
 
 
@@ -325,6 +413,7 @@ def _init_batch_eval_results(test_subjects: list[Any]) -> BatchEvalResults:
             str(subject): _init_metric_buckets() for subject in test_subjects
         },
         overall=_init_metric_buckets(),
+        metadata={},
     )
 
 
@@ -457,6 +546,23 @@ def _build_eval_json_payload(
             aggregation="micro-average over (subject, dy_grid) vs source",
         )
 
+    if any(results.overall.get(key) for key in _MV_METRIC_KEYS):
+        payload["multiview_consistency"] = _aggregate_track(
+            results,
+            _MV_METRIC_KEYS,
+            aggregation="micro-average over (subject, adjacent yaw pair)",
+        )
+
+    if any(results.overall.get(key) for key in _POSE_METRIC_KEYS):
+        payload["pose_accuracy"] = _aggregate_track(
+            results,
+            _POSE_METRIC_KEYS,
+            aggregation="micro-average over (subject, dy_grid)",
+        )
+
+    if results.metadata:
+        payload["gt_reference"] = dict(results.metadata)
+
     return payload
 
 
@@ -571,6 +677,10 @@ def save_batch_eval_logs(
         "fg_lpips": _mean_or_none(results.overall.get("fg_lpips", [])),
         "identity_n": identity_n,
         "identity": _mean_or_none(results.overall.get("identity", [])),
+        "mv_warp_error": _mean_or_none(results.overall.get("mv_warp_error", [])),
+        "gt_mv_warp_error": _mean_or_none(results.overall.get("gt_mv_warp_error", [])),
+        "pose_yaw_error": _mean_or_none(results.overall.get("pose_yaw_error", [])),
+        "pose_pitch_leak": _mean_or_none(results.overall.get("pose_pitch_leak", [])),
         "src_view_idx": eval_config.get("src_view_idx", ""),
         "recon_view_indices": recon_view_indices_str,
         "identity_num_yaws": eval_config.get("identity_num_yaws", ""),
@@ -588,31 +698,78 @@ def _generate_batch(
     dy_list: list[float] | None = None,
     eval_gen_batch_size: int | None = None,
 ) -> list[Image.Image]:
-    pose_list = delta_pose_list if delta_pose_list is not None else dy_list
-    if pose_list is None:
-        raise ValueError("pass delta_pose_list or dy_list")
+    if delta_pose_list is not None:
+        return generate_batch(
+            toss,
+            src_input,
+            prompt="",
+            delta_pose_list=delta_pose_list,
+            shared_noise=True,
+            chunk_size=eval_gen_batch_size,
+        )
+    if dy_list is not None:
+        return generate_batch(
+            toss,
+            src_input,
+            prompt="",
+            dy_list=dy_list,
+            shared_noise=True,
+            chunk_size=eval_gen_batch_size,
+        )
+    raise ValueError("pass delta_pose_list or dy_list")
 
-    gen_pils: list[Image.Image] = []
-    chunk = eval_gen_batch_size or len(pose_list)
-    with torch.no_grad():
-        for start in range(0, len(pose_list), chunk):
-            batch = pose_list[start : start + chunk]
-            if delta_pose_list is not None:
-                outs = generate_batch(
-                    toss,
-                    src_input,
-                    prompt="",
-                    delta_pose_list=batch,
-                )
-            else:
-                outs = generate_batch(
-                    toss,
-                    src_input,
-                    prompt="",
-                    dy_list=batch,
-                )
-            gen_pils.extend(outs)
-    return gen_pils
+
+def _load_subject_rgba(
+    sub_path: str,
+    view_idx: int,
+) -> tuple[Image.Image, Image.Image]:
+    img = Image.open(os.path.join(sub_path, f"{view_idx:05d}.png")).convert("RGBA")
+    mask = Image.open(
+        os.path.join(sub_path, f"alpha_maps/{view_idx:05d}.png")
+    ).convert("L")
+    return img, mask
+
+
+def _preprocessed_pil(img: Image.Image, mask: Image.Image) -> Image.Image:
+    arr = preprocess_image(img, fg_mask=mask)
+    return Image.fromarray(np.clip(arr * 255.0, 0, 255).astype(np.uint8))
+
+
+def _record_gt_references(
+    results: BatchEvalResults,
+    subject: str,
+    sub_path: str,
+    poses: np.ndarray,
+    src_view_idx: int,
+    src_input: Image.Image,
+    mv_evaluator: MultiviewMetricsEvaluator,
+    gt_calib_samples: list[tuple[np.ndarray, Image.Image, Image.Image, int, int]],
+) -> None:
+    horiz_views = select_horizontal_views(poses, src_view_idx)
+    if len(horiz_views) < 2:
+        return
+
+    gt_images: list[Image.Image] = []
+    gt_masks: list[Image.Image] = []
+    gt_yaws: list[float] = []
+
+    for view_idx in horiz_views:
+        gt_img, gt_mask = _load_subject_rgba(sub_path, view_idx)
+        gt_pil = _preprocessed_pil(gt_img, gt_mask)
+        delta = compute_relative_pose(poses[src_view_idx], poses[view_idx])
+        gt_yaws.append(float(np.degrees(delta[1])))
+        gt_images.append(gt_pil)
+        gt_masks.append(gt_mask)
+        gt_calib_samples.append((poses, src_input, gt_pil, src_view_idx, view_idx))
+
+    pair_errors = mv_evaluator.compute_adjacent_warp_errors(
+        gt_images,
+        gt_yaws,
+        fg_masks=gt_masks,
+        yaw_key_fn=_yaw_key,
+    )
+    for left_yaw, err in pair_errors:
+        _record_metrics(results, subject, left_yaw, {"gt_mv_warp_error": err})
 
 
 def _record_metrics(
@@ -646,6 +803,8 @@ def run_batch_eval(
     checkpoint: str | None = None,
     eval_config: dict[str, Any] | None = None,
     log_dir: str | Path | None = None,
+    mv_evaluator: MultiviewMetricsEvaluator | None = None,
+    pose_estimator: HeadPoseEstimator | None = None,
 ) -> BatchEvalResults:
     """
     Generate novel views per subject and evaluate with metrics_evaluator.
@@ -677,6 +836,18 @@ def run_batch_eval(
     metrics_config = metrics_config or {}
     run_reconstruction = _reconstruction_enabled(metrics_config)
     run_identity = metrics_config.get("identity", True)
+    run_mv = metrics_config.get("mv_consistency", True)
+    run_pose = metrics_config.get("pose_accuracy", True)
+    run_gt_refs = metrics_config.get("gt_references", True)
+    run_sweep = run_identity or run_mv or run_pose
+
+    device = getattr(toss, "device", torch.device("cpu"))
+    if (run_mv or run_gt_refs) and mv_evaluator is None:
+        mv_evaluator = MultiviewMetricsEvaluator(device=device)
+    if (run_pose or run_gt_refs) and pose_estimator is None:
+        pose_estimator = HeadPoseEstimator(device=str(device))
+
+    gt_calib_samples: list[tuple[np.ndarray, Image.Image, Image.Image, int, int]] = []
 
     run_eval_config = _build_run_eval_config(
         src_view_idx=src_view_idx,
@@ -823,7 +994,7 @@ def run_batch_eval(
                             f"FG LPIPS={m.get('fg_lpips', float('nan')):.4f}"
                         )
 
-        if run_identity:
+        if run_sweep:
             id_pils = _generate_batch(
                 toss,
                 src_input,
@@ -831,22 +1002,76 @@ def run_batch_eval(
                 eval_gen_batch_size=eval_gen_batch_size,
             )
 
+            if run_mv and mv_evaluator is not None:
+                pair_errors = mv_evaluator.compute_adjacent_warp_errors(
+                    id_pils,
+                    dy_grid,
+                    fg_masks=[src_mask] * len(id_pils),
+                    yaw_key_fn=_yaw_key,
+                )
+                for left_yaw, err in pair_errors:
+                    _record_metrics(
+                        results,
+                        subject,
+                        left_yaw,
+                        {"mv_warp_error": err},
+                    )
+                    if verbose:
+                        print(
+                            f"subject {subject}, "
+                            f"pair left yaw={left_yaw:+.1f}° [mv] | "
+                            f"warp_err={err:.4f}"
+                        )
+
             for gen_pil, dy_deg in zip(id_pils, dy_grid):
                 yaw_key = _yaw_key(dy_deg)
                 gen_np = preprocess_image(
                     gen_pil.convert("RGB"),
                     fg_mask=src_mask,
                 )
-                id_sim = metrics_evaluator.compute_identity_metric(gen_np, src_np)
-                m = {"identity": id_sim}
-                _record_metrics(results, subject, yaw_key, m)
 
-                if verbose:
-                    print(
+                metrics: dict[str, float] = {}
+                if run_identity:
+                    metrics["identity"] = metrics_evaluator.compute_identity_metric(
+                        gen_np, src_np
+                    )
+                if run_pose and pose_estimator is not None:
+                    metrics.update(
+                        compute_pose_errors(
+                            dy_deg,
+                            gen_pil.convert("RGB"),
+                            src_input.convert("RGB"),
+                            pose_estimator,
+                        )
+                    )
+
+                if metrics:
+                    _record_metrics(results, subject, yaw_key, metrics)
+
+                if verbose and run_identity and "identity" in metrics:
+                    msg = (
                         f"subject {subject}, "
                         f"dy={yaw_key:+.1f}° [identity vs source] | "
-                        f"IdSim={id_sim:.4f}"
+                        f"IdSim={metrics['identity']:.4f}"
                     )
+                    if run_pose and "pose_yaw_error" in metrics:
+                        msg += (
+                            f" | pose_yaw_err={metrics['pose_yaw_error']:.2f}°"
+                            f" | pitch_leak={metrics['pose_pitch_leak']:.2f}°"
+                        )
+                    print(msg)
+
+        if run_gt_refs and mv_evaluator is not None and pose_estimator is not None:
+            _record_gt_references(
+                results,
+                subject,
+                sub_path,
+                poses,
+                src_view_idx,
+                src_input,
+                mv_evaluator,
+                gt_calib_samples,
+            )
 
         completed_subjects.append(subject)
         completed_set.add(subject)
@@ -865,6 +1090,13 @@ def run_batch_eval(
                     f"subject {subject}: checkpoint saved "
                     f"({len(completed_subjects)}/{len(subject_ids)})"
                 )
+
+    if run_gt_refs and gt_calib_samples and pose_estimator is not None:
+        calib = calibrate_pose_estimator_on_gt(pose_estimator, gt_calib_samples)
+        results.metadata["pose_estimator_gt_mae_deg"] = calib.mae_deg
+        results.metadata["pose_estimator_gt_slope"] = calib.slope
+        results.metadata["pose_estimator_gt_intercept"] = calib.intercept
+        results.metadata["pose_estimator_gt_n"] = calib.n_samples
 
     if verbose:
         print_batch_eval_summary(

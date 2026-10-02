@@ -94,3 +94,26 @@ def identity_dy_grid(
         raise ValueError("identity grid size must be at least 1")
     grid = np.linspace(float(yaw_min), float(yaw_max), int(n), dtype=np.float64)
     return [float(yaw) for yaw in grid]
+
+
+def select_horizontal_views(
+    poses: np.ndarray,
+    src_view_idx: int,
+    *,
+    pitch_threshold_deg: float = 15.0,
+) -> list[int]:
+    """Return non-source views with small relative pitch, sorted by relative yaw."""
+    num_views = len(poses)
+    selected: list[tuple[float, int]] = []
+
+    for view_idx in range(num_views):
+        if view_idx == src_view_idx:
+            continue
+        delta = compute_relative_pose(poses[src_view_idx], poses[view_idx])
+        pitch_deg = abs(float(np.degrees(delta[0])))
+        if pitch_deg <= pitch_threshold_deg:
+            yaw_deg = float(np.degrees(delta[1]))
+            selected.append((yaw_deg, view_idx))
+
+    selected.sort(key=lambda item: item[0])
+    return [view_idx for _, view_idx in selected]

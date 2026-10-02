@@ -14,6 +14,8 @@ from utils.eval_metrics import (
     compute_metrics,
     compute_psnr,
 )
+from utils.head_pose import HeadPoseEstimator, compute_pose_errors
+from utils.multiview_metrics import MultiviewMetricsEvaluator
 from utils.image import normalize_mask, preprocess_image, resize_mask, to_numpy_rgb
 from utils.inference import TossInference, generate_batch
 from utils.pose import (
@@ -22,6 +24,7 @@ from utils.pose import (
     identity_dy_grid,
     pose_matrix_to_toss_format,
     rotation_matrix_to_euler,
+    select_horizontal_views,
     select_recon_views,
 )
 from utils.toss_human_dataset import TossHumanDataset
@@ -34,7 +37,10 @@ __all__ = [
     "TossInference",
     "format_batch_eval_summary",
     "generate_batch",
+    "HeadPoseEstimator",
+    "MultiviewMetricsEvaluator",
     "compute_identity_similarity",
+    "compute_pose_errors",
     "compute_lpips",
     "compute_metrics",
     "compute_psnr",
@@ -50,6 +56,7 @@ __all__ = [
     "preprocess_image",
     "resize_mask",
     "rotation_matrix_to_euler",
+    "select_horizontal_views",
     "select_recon_views",
     "to_numpy_rgb",
 ]
