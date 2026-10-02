@@ -384,10 +384,11 @@ class TossLoraModule(TOSS):
             probe.append(("d/dproj_b", self.corr_proj.bias))
         print(f"[CORR-GRAD step={step}] {_grad_probe(loss_corr, probe)}")
 
-    def _compute_corr_loss(self, batch, x, debug=False):
+    def _compute_corr_loss(self, batch, x, src_kept=None, debug=False):
         """Correlation feature regularization on the captured last-output-block feature.
 
         Returns (loss_corr, log_dict) or (None, {}) if inputs are unavailable.
+        ``src_kept`` masks out UCG-dropped samples where ``in_concat`` was zeroed.
         """
         feat = self._corr_feat.get("feat")
         if feat is None:
@@ -434,11 +435,19 @@ class TossLoraModule(TOSS):
         if valid_mask.shape[-2:] != feat_hw:
             valid_mask = F.interpolate(valid_mask, size=feat_hw, mode="nearest")
 
+        if src_kept is not None:
+            src_kept = src_kept.to(valid_mask.device)
+            if not src_kept.any():
+                return None, {}
+            valid_mask = valid_mask * src_kept.view(-1, 1, 1, 1).float()
+
         numer = (((corr_pred - corr_gt) ** 2) * valid_mask).sum()
         loss_corr = numer / (valid_mask.sum() + 1e-8)
 
         in_bounds_ratio = (in_bounds * valid_mask).sum() / (valid_mask.sum() + 1e-8)
         log = {"corr_loss": loss_corr, "corr_flow_in_bounds": in_bounds_ratio}
+        if src_kept is not None:
+            log["corr_src_kept_ratio"] = src_kept.float().mean()
 
         with torch.no_grad():
             vm = valid_mask > 0.5
@@ -609,6 +618,7 @@ class TossLoraModule(TOSS):
             self.model.diffusion_model.enable_adapters()
         
         x, cond = self.get_input(batch, self.first_stage_key)
+        src_kept = cond["in_concat"][0].flatten(1).abs().sum(dim=1) > 0  # [B] bool
 
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
         noise = torch.randn_like(x)
@@ -647,7 +657,9 @@ class TossLoraModule(TOSS):
         '''Correlation feature regularization'''
         if self.lambda_corr > 0.0:
             debug_corr = int(self.global_step) < self.corr_debug_steps
-            corr_loss, corr_log = self._compute_corr_loss(batch, x, debug=debug_corr)
+            corr_loss, corr_log = self._compute_corr_loss(
+                batch, x, src_kept=src_kept, debug=debug_corr
+            )
             if corr_loss is not None:
                 loss = loss + self.lambda_corr * corr_loss
 
