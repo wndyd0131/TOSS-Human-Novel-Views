@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw
 
 from utils.eval_metrics import compute_psnr
 from utils.image import ImageInput, preprocess_image, to_numpy_rgb
-from utils.inference import TossInference, _prepare_cond_im_on_toss, _resolve_pl_module
+from utils.inference import generate_batch, _resolve_pl_module
 from utils.pose import select_horizontal_views
 
 
@@ -73,7 +73,9 @@ def vae_roundtrip_tensor(
     """
     pl_module = _resolve_pl_module(toss)
     x = rgb_01 * 2.0 - 1.0
-    z = pl_module.encode_first_stage(x).mode()
+    posterior = pl_module.encode_first_stage(x)
+    # Match training/inference: latent is scaled before decode (see get_first_stage_encoding).
+    z = pl_module.scale_factor * posterior.mode()
     recon = pl_module.decode_first_stage(z)
     return torch.clamp((recon + 1.0) / 2.0, 0.0, 1.0)
 
@@ -209,7 +211,7 @@ def compare_subject_color_stats(
 
 
 def sweep_img_scale(
-    toss: TossInference,
+    toss: Any,
     image: ImageInput,
     *,
     dy_deg: float = 0.0,
@@ -220,15 +222,17 @@ def sweep_img_scale(
     """Generate one yaw with multiple CFG ``img_scale`` values."""
     outputs: list[tuple[float, Image.Image]] = []
     for scale in img_scales:
-        toss.set_seed(seed)
-        out = toss.generate(
+        if hasattr(toss, "set_seed"):
+            toss.set_seed(seed)
+        batch = generate_batch(
+            toss,
             image,
-            dy=dy_deg,
+            dy_list=[dy_deg],
             img_scale=float(scale),
             ddim_steps=ddim_steps,
             shared_noise=True,
         )
-        outputs.append((float(scale), out))
+        outputs.append((float(scale), batch[0]))
     return outputs
 
 
@@ -273,7 +277,7 @@ def print_vae_roundtrip_summary(results: Sequence[VAERoundtripResult]) -> None:
 
 
 def run_quality_diagnostics(
-    toss: TossInference,
+    toss: Any,
     subject_root: str | Path,
     *,
     src_view_idx: int = 3,
@@ -300,7 +304,9 @@ def run_quality_diagnostics(
         poses_path = subject_root / "poses.npy"
     if Path(poses_path).exists():
         poses = np.load(poses_path)
-        view_indices = select_horizontal_views(poses, src_view_idx)
+        # ``select_horizontal_views`` excludes source; prepend it for src roundtrip panels.
+        horiz_views = select_horizontal_views(poses, src_view_idx)
+        view_indices = [src_view_idx] + horiz_views
 
     vae_results = compare_subject_vae_roundtrip(
         toss,
@@ -330,14 +336,11 @@ def run_quality_diagnostics(
         print(f"img_scale={scale:.1f}")
     outputs["cfg_sweep"] = cfg_results
 
-    src_result = next(
-        (r for r in vae_results if r.label == "src"),
-        vae_results[0],
-    )
+    src_result = next(r for r in vae_results if r.label == "src")
     vae_strip = make_comparison_strip(
         [
-            (src_result.original, "source"),
-            (src_result.reconstruction, "VAE recon"),
+            (src_result.original, f"source (view {src_view_idx:02d})"),
+            (src_result.reconstruction, "VAE recon (same view)"),
         ]
     )
     cfg_strip = make_comparison_strip(
@@ -348,8 +351,8 @@ def run_quality_diagnostics(
     if gen_at_zero is not None:
         compare_strip = make_comparison_strip(
             [
-                (src_pil, "source"),
-                (vae_results[0].reconstruction, "vae recon"),
+                (src_result.original, f"source (view {src_view_idx:02d})"),
+                (src_result.reconstruction, "VAE recon (same view)"),
                 (gen_at_zero, f"gen dy={dy_deg:+.0f}°"),
             ]
         )
