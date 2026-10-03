@@ -131,10 +131,12 @@ class TossHumanDataset(Dataset):
         load_depth=False,
         load_corr=True,
         preload_subject_arrays=False,
+        image_size=256,
     ):
         super().__init__()
         self.root_dir = root_dir
         self.transform = transform
+        self.image_size = int(image_size)
         self.src_view_idx = src_view_idx
         self.skip_identity = skip_identity
         self.load_normals = load_normals
@@ -265,8 +267,8 @@ class TossHumanDataset(Dataset):
         )
         delta_pose = torch.from_numpy(delta_pose).float()
 
-        src = preprocess_image(src, fg_mask=src_mask)
-        image = preprocess_image(image, fg_mask=mask)
+        src = preprocess_image(src, fg_mask=src_mask, size=self.image_size)
+        image = preprocess_image(image, fg_mask=mask, size=self.image_size)
 
         src = torch.from_numpy(src).permute(2, 0, 1).float()
         image = torch.from_numpy(image).permute(2, 0, 1).float()
@@ -275,7 +277,10 @@ class TossHumanDataset(Dataset):
             src = self.transform(src)
             image = self.transform(image)
 
-        mask_transform = T.Compose([T.Resize((256, 256)), T.ToTensor()])
+        mask_transform = T.Compose([
+            T.Resize((self.image_size, self.image_size)),
+            T.ToTensor(),
+        ])
         mask = mask_transform(mask)
 
         out = {
@@ -290,7 +295,9 @@ class TossHumanDataset(Dataset):
         if self.load_normals:
             normal_path = os.path.join(sub_path, sample["normal_file"])
             normal_img = Image.open(normal_path).convert("RGB")
-            normal_img = normal_img.resize((256, 256), Image.NEAREST)
+            normal_img = normal_img.resize(
+                (self.image_size, self.image_size), Image.NEAREST
+            )
             normal_np = np.array(normal_img).astype(np.float32) / 255.0
             fg_for_normal = mask[0].numpy()
             normal, normal_valid_mask = preprocess_normal_for_cosine(
@@ -308,7 +315,7 @@ class TossHumanDataset(Dataset):
             depth_t = torch.from_numpy(depth_np).float().unsqueeze(0)
             depth_t = F.interpolate(
                 depth_t.unsqueeze(0),
-                size=(256, 256),
+                size=(self.image_size, self.image_size),
                 mode="bilinear",
                 align_corners=False,
             ).squeeze(0)

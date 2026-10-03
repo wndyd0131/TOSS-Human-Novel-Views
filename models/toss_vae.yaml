@@ -91,7 +91,7 @@ model:
     first_stage_key: "jpg"
     cond_stage_key: "txt"
     control_key: "hint"
-    image_size: 32
+    image_size: 64
     channels: 4
     cond_stage_trainable: false
     conditioning_key: crossattn
@@ -105,7 +105,7 @@ model:
     finetune: True
     ucg_img: 0.05
 
-    lambda_corr: 0.1
+    lambda_corr: 0.0
     corr_flow_src_size: 32
 
     # Identity loss (ArcFace)
