@@ -28,6 +28,14 @@ from utils.pose import (
     select_recon_views,
 )
 from utils.toss_human_dataset import TossHumanDataset
+from utils.vae_diagnostics import (
+    compare_subject_color_stats,
+    compare_subject_vae_roundtrip,
+    load_subject_view,
+    run_quality_diagnostics,
+    sweep_img_scale,
+    vae_roundtrip_image,
+)
 
 __all__ = [
     "BatchEvalResults",
@@ -58,5 +66,11 @@ __all__ = [
     "rotation_matrix_to_euler",
     "select_horizontal_views",
     "select_recon_views",
+    "compare_subject_color_stats",
+    "compare_subject_vae_roundtrip",
+    "load_subject_view",
+    "run_quality_diagnostics",
+    "sweep_img_scale",
     "to_numpy_rgb",
+    "vae_roundtrip_image",
 ]
