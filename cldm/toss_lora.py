@@ -608,41 +608,27 @@ class TossLoraModule(TOSS):
             wandb_log["normal_gt_and_preds"] = normal_gt_and_preds
         print(f"[VIS] Logged multiview (+ normals) at step {step}")
 
-    def training_step(self, batch, batch_idx):
-
-        # Ensure model is in training mode
-        self.model.diffusion_model.train()
-        
-        # CRITICAL: Explicitly enable LoRA adapters for PEFT
-        if hasattr(self.model.diffusion_model, 'enable_adapters'):
-            self.model.diffusion_model.enable_adapters()
-        
+    def _compute_batch_loss(self, batch, *, decode_mode="train"):
+        """Shared train/val loss: masked MSE + optional corr, identity, DISTS."""
         x, cond = self.get_input(batch, self.first_stage_key)
         src_kept = cond["in_concat"][0].flatten(1).abs().sum(dim=1) > 0  # [B] bool
 
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
         noise = torch.randn_like(x)
-
         x_noisy = self.q_sample(x_start=x, t=t, noise=noise)
-
-        '''Forward'''
         model_output = self.apply_model(x_noisy, t, cond)
 
         mse_loss = F.mse_loss(model_output, noise, reduction="mean")
 
-        '''Masked Loss'''
-        mask = batch.get("mask")  # Original mask [B, 1, 256, 256]
+        mask = batch.get("mask")
         masked_mse_loss = None
-
         if mask is not None:
             mask = mask.to(self.device)
-            # Soft mask: mask=1 (face) -> weight=1.0, mask=0 (background) -> weight=min_weight
             soft_mask = mask * (1.0 - self.mask_min_weight) + self.mask_min_weight
-
-            # Masked latent MSE, normalized by mask sum to avoid diluting head signal
             latent_mask = F.interpolate(soft_mask, size=model_output.shape[-2:], mode="area")
-            masked_mse_loss = (F.mse_loss(model_output, noise, reduction="none") * latent_mask).sum() / latent_mask.sum()
-
+            masked_mse_loss = (
+                F.mse_loss(model_output, noise, reduction="none") * latent_mask
+            ).sum() / latent_mask.sum()
             loss = self.mse_weight * masked_mse_loss
         else:
             loss = mse_loss
@@ -654,9 +640,11 @@ class TossLoraModule(TOSS):
         corr_loss = None
         corr_log = {}
 
-        '''Correlation feature regularization'''
         if self.lambda_corr > 0.0:
-            debug_corr = int(self.global_step) < self.corr_debug_steps
+            debug_corr = (
+                decode_mode == "train"
+                and int(self.global_step) < self.corr_debug_steps
+            )
             corr_loss, corr_log = self._compute_corr_loss(
                 batch, x, src_kept=src_kept, debug=debug_corr
             )
@@ -664,30 +652,31 @@ class TossLoraModule(TOSS):
                 loss = loss + self.lambda_corr * corr_loss
 
         need_identity = self.identity_loss_weight > 0.0
-        need_dists    = self.dists_loss_weight    > 0.0
+        need_dists = self.dists_loss_weight > 0.0
 
-        # Decode pred_rgb / gt_rgb ONCE on the union mask so identity and DISTS
-        # share a single VAE-decoder forward + backward graph (memory win:
-        # avoids running the decoder twice). t가 높을 경우 너무 noisy하기 때문에
-        # 예측이 불안정하여, timestep가 높은 경우에는 비교하지 않음.
         if need_identity or need_dists:
             union_cut = max(
                 self.identity_t_cut if need_identity else 0,
-                self.dists_t_cut    if need_dists    else 0,
+                self.dists_t_cut if need_dists else 0,
             )
             sel = t < union_cut
             if torch.any(sel):
-                x0_pred = self.predict_start_from_noise(x_noisy[sel], t[sel], model_output[sel]) # clean latent
-                pred_img = self._decode_first_stage_train(x0_pred) # latent to image, gradients reach RGB
-                pred_rgb = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0) # [-1, 1] to [0, 1]
-                gt_rgb = self._gt_rgb_01_from_batch(batch)[sel] # rgb to [0, 1]
+                x0_pred = self.predict_start_from_noise(
+                    x_noisy[sel], t[sel], model_output[sel]
+                )
+                if decode_mode == "train":
+                    pred_img = self._decode_first_stage_train(x0_pred)
+                else:
+                    pred_img = self.decode_first_stage(x0_pred)
+                pred_rgb = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
+                gt_rgb = self._gt_rgb_01_from_batch(batch)[sel]
                 t_sel = t[sel]
 
                 if need_identity:
                     sub = t_sel < self.identity_t_cut
                     if torch.any(sub):
                         pred_rgb_id = pred_rgb[sub]
-                        gt_rgb_id   = gt_rgb[sub]
+                        gt_rgb_id = gt_rgb[sub]
 
                         backbone = self._ensure_arcface_backbone()
                         with self._identity_autocast_ctx():
@@ -701,44 +690,94 @@ class TossLoraModule(TOSS):
                             )
                             emb_pred = F.normalize(backbone(pred_arc), dim=-1)
                             emb_gt = F.normalize(backbone(gt_arc), dim=-1).detach()
-                        identity_loss = (1.0 - (emb_pred * emb_gt).sum(dim=-1)).mean() # cosine similarity loss
+                        identity_loss = (1.0 - (emb_pred * emb_gt).sum(dim=-1)).mean()
                         loss = loss + self.identity_loss_weight * identity_loss
 
                 if need_dists:
                     sub = t_sel < self.dists_t_cut
                     if torch.any(sub):
                         pred_rgb_d = pred_rgb[sub].float()
-                        gt_rgb_d   = gt_rgb[sub].float().detach()
+                        gt_rgb_d = gt_rgb[sub].float().detach()
 
                         dists_model = self._ensure_dists()
-                        d_img = dists_model(pred_rgb_d, gt_rgb_d, require_grad=True, batch_average=True)
+                        require_grad = decode_mode == "train"
+                        d_img = dists_model(
+                            pred_rgb_d, gt_rgb_d,
+                            require_grad=require_grad,
+                            batch_average=True,
+                        )
 
                         pred_sobel = _grayscale_sobel_3ch(pred_rgb_d)
-                        gt_sobel   = _grayscale_sobel_3ch(gt_rgb_d).detach()
-                        d_sobel = dists_model(pred_sobel, gt_sobel, require_grad=True, batch_average=True)
+                        gt_sobel = _grayscale_sobel_3ch(gt_rgb_d).detach()
+                        d_sobel = dists_model(
+                            pred_sobel, gt_sobel,
+                            require_grad=require_grad,
+                            batch_average=True,
+                        )
 
                         dists_loss = d_img + d_sobel
                         loss = loss + self.dists_loss_weight * dists_loss
 
         mse_for_grad = masked_mse_loss if masked_mse_loss is not None else mse_loss
 
-        wandb_log = {
+        log_dict = {
             "loss": loss,
             "mse_loss": mse_loss,
         }
         if masked_mse_loss is not None:
-            wandb_log["masked_mse_loss"] = masked_mse_loss
+            log_dict["masked_mse_loss"] = masked_mse_loss
         if identity_loss is not None:
-            wandb_log["identity_loss"] = identity_loss
+            log_dict["identity_loss"] = identity_loss
         if dists_loss is not None:
-            wandb_log["dists_loss"] = dists_loss
-            wandb_log["dists_loss_img"] = d_img
-            wandb_log["dists_loss_sobel"] = d_sobel
+            log_dict["dists_loss"] = dists_loss
+            log_dict["dists_loss_img"] = d_img
+            log_dict["dists_loss_sobel"] = d_sobel
         if corr_loss is not None:
-            wandb_log.update(corr_log)
-            wandb_log["weighted_corr_loss"] = self.lambda_corr * corr_loss
+            log_dict.update(corr_log)
+            log_dict["weighted_corr_loss"] = self.lambda_corr * corr_loss
 
-        '''WanDB logging'''
+        return loss, log_dict, mse_for_grad, corr_loss, dists_loss
+
+    @torch.no_grad()
+    def validation_step(self, batch, batch_idx):
+        loss, log_dict, _, _, _ = self._compute_batch_loss(batch, decode_mode="eval")
+        val_logs = {f"val/{k}": v for k, v in log_dict.items()}
+        self.log_dict(
+            val_logs,
+            prog_bar=True,
+            logger=True,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        return loss
+
+    def on_validation_epoch_end(self):
+        if run is None or self.trainer is None:
+            return
+        metrics = {}
+        for key, value in self.trainer.callback_metrics.items():
+            if not str(key).startswith("val/"):
+                continue
+            if torch.is_tensor(value):
+                metrics[key] = value.detach().item()
+            else:
+                metrics[key] = value
+        if metrics:
+            run.log(metrics, step=int(self.global_step))
+
+    def training_step(self, batch, batch_idx):
+        self.model.diffusion_model.train()
+
+        if hasattr(self.model.diffusion_model, "enable_adapters"):
+            self.model.diffusion_model.enable_adapters()
+
+        loss, log_dict, mse_for_grad, corr_loss, dists_loss = self._compute_batch_loss(
+            batch, decode_mode="train"
+        )
+
+        wandb_log = dict(log_dict)
+
         if self.global_step % 50 == 0:
 
             # Gradient 진단용 parameter groups
@@ -788,6 +827,19 @@ class TossLoraModule(TOSS):
 
                 wandb_log["corr_mse_grad_ratio_lora"] = (
                     corr_g / (mse_g + 1e-12))
+
+            if dists_loss is not None:
+                weighted_dists = self.dists_loss_weight * dists_loss
+                wandb_log["dists_grad_lora"] = _grad_norm_l2(
+                    weighted_dists, lora_params
+                )
+                wandb_log["dists_grad_finetune"] = _grad_norm_l2(
+                    weighted_dists, finetune_params
+                )
+                wandb_log["dists_mse_grad_ratio_lora"] = (
+                    wandb_log["dists_grad_lora"]
+                    / (wandb_log["mse_grad_lora"] + 1e-12)
+                )
 
         if self.vis_every_n_steps > 0 and self.global_step % self.vis_every_n_steps == 0:
             self._log_multiview_vis(batch, wandb_log)
