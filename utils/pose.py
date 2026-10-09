@@ -12,17 +12,19 @@ def rotation_matrix_to_euler(R: np.ndarray) -> tuple[float, float]:
     Extract pitch (x-rotation) and yaw (y-rotation) from a 3x3 rotation matrix.
     Returns angles in radians.
 
-    Assumes rotation order: R = Ry(yaw) @ Rx(pitch) @ Rz(roll)
+    Assumes R = Ry(yaw) @ Rx(pitch) @ Rz(roll). Roll is ignored; pitch and yaw
+    are read from the third column, which is independent of roll:
+      R[:, 2] = [sin(y)*cos(p), -sin(p), cos(y)*cos(p)]
     """
-    sy = np.clip(R[0, 2], -1.0, 1.0)
-    yaw = np.arcsin(sy)
-
-    if np.abs(sy) < 0.99999:
-        pitch = np.arctan2(-R[1, 2], R[2, 2])
+    R = np.asarray(R, dtype=np.float64)
+    sin_pitch = np.clip(-R[1, 2], -1.0, 1.0)
+    pitch = float(np.arcsin(sin_pitch))
+    cos_pitch = float(np.cos(pitch))
+    if cos_pitch > 1e-6:
+        yaw = float(np.arctan2(R[0, 2], R[2, 2]))
     else:
-        pitch = np.arctan2(R[2, 1], R[1, 1])
-
-    return float(pitch), float(yaw)
+        yaw = 0.0  # gimbal lock: pitch ≈ ±90°
+    return pitch, yaw
 
 
 def pose_matrix_to_toss_format(pose_4x4: np.ndarray) -> np.ndarray:
