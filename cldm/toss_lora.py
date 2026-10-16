@@ -103,7 +103,13 @@ class TossLoraModule(TOSS):
         vis_yaws_deg=(-15, -5, 5, 15),
         vis_ddim_steps=30,
         vis_img_scale=3.0,
-        vis_seed=0,
+        vis_prompt_scale=1.0,
+        vis_seed=40,
+        vis_image_size=256,
+        vis_precision="autocast",
+        vis_use_ema_scope=False,
+        vis_source_image=None,
+        vis_source_mask=None,
         **kwargs,
     ):
         kwargs.pop("lora_config_params", None)  # consumed by us
@@ -135,8 +141,18 @@ class TossLoraModule(TOSS):
         self.vis_yaws_deg = [float(y) for y in kwargs.pop("vis_yaws_deg", vis_yaws_deg)]
         self.vis_ddim_steps = int(kwargs.pop("vis_ddim_steps", vis_ddim_steps))
         self.vis_img_scale = float(kwargs.pop("vis_img_scale", vis_img_scale))
+        self.vis_prompt_scale = float(kwargs.pop("vis_prompt_scale", vis_prompt_scale))
         self.vis_seed = int(kwargs.pop("vis_seed", vis_seed))
+        self.vis_image_size = int(kwargs.pop("vis_image_size", vis_image_size))
+        self.vis_precision = str(kwargs.pop("vis_precision", vis_precision))
+        self.vis_use_ema_scope = bool(kwargs.pop("vis_use_ema_scope", vis_use_ema_scope))
+        self.vis_source_image = kwargs.pop("vis_source_image", vis_source_image)
+        self.vis_source_mask = kwargs.pop("vis_source_mask", vis_source_mask)
         super().__init__(*args, **kwargs)
+        self._default_h = self.vis_image_size
+        self._default_w = self.vis_image_size
+        self._default_use_ema_scope = self.vis_use_ema_scope
+        self._default_pose_enc = "freq"
         self._normal_estimator = None
         self._arcface_backbone = None
         self._dists_model = None
@@ -144,6 +160,7 @@ class TossLoraModule(TOSS):
         # Plain attributes (not buffers) so they are never written into checkpoints.
         self._vis_sources = None
         self._vis_names = None
+        self._vis_source_pils = None
 
         global run
         kst = pytz.timezone("Asia/Seoul")
@@ -322,9 +339,29 @@ class TossLoraModule(TOSS):
         # checkpoint["state_dict"] = {k: v for k, v in checkpoint["state_dict"].items() if "lora" in k or "pose_net" in k}
         pass
 
+    def _load_vis_source_from_paths(self):
+        """Load fixed RGBA + mask paths (same preprocessing as batch_eval / Colab)."""
+        from utils.image import preprocess_image
+
+        if not self.vis_source_image:
+            return
+        img = Image.open(self.vis_source_image).convert("RGBA")
+        mask = None
+        if self.vis_source_mask:
+            mask = Image.open(self.vis_source_mask).convert("L")
+        arr = preprocess_image(img, fg_mask=mask, size=self.vis_image_size)
+        pil = Image.fromarray(np.clip(arr * 255.0, 0, 255).astype(np.uint8))
+        name = str(self.vis_source_image)
+        self._vis_source_pils = [pil]
+        self._vis_names = [name]
+        hint = torch.from_numpy(arr).permute(2, 0, 1).float()
+        self._vis_sources = hint.unsqueeze(0)
+        print(f"[VIS] Fixed source from disk: {name}")
+
     def on_train_start(self):
         """Called by PyTorch Lightning when training starts - log trainer config"""
         self._trainable_params = [p for p in self.parameters() if p.requires_grad]
+        self._load_vis_source_from_paths()
         if run is not None and self.trainer is not None:
             run.config.update({
                 "max_epochs": self.trainer.max_epochs,
@@ -516,75 +553,70 @@ class TossLoraModule(TOSS):
             images = einops.rearrange(images, "b h w c -> b c h w")
         self._vis_sources = images.detach().float().cpu().clone()
         self._vis_names = list(names) if names is not None else [str(i) for i in range(images.shape[0])]
+        self._vis_source_pils = [
+            self._hint_tensor_to_pil(self._vis_sources[i]) for i in range(self._vis_sources.shape[0])
+        ]
         print(f"[VIS] Fixed {len(self._vis_names)} visualization source(s): {self._vis_names}")
 
     def _log_multiview_vis(self, batch, wandb_log):
-        """Sample fixed sources at ``vis_yaws_deg`` with eval-matched settings and add them to ``wandb_log``."""
-        if self._vis_sources is None:
+        """Sample fixed sources via ``utils.inference.generate_batch`` (Colab / eval path)."""
+        from utils.inference import generate_batch
+
+        if self._vis_sources is None and self._vis_source_pils is None:
             src = batch[self.control_key][:1]
-            self.set_vis_sources(src, names=[str(batch["subject_id"][0])] if "subject_id" in batch else None)
-            print("[VIS][WARN] set_vis_sources() was not called; using the first training source for all steps.")
+            self.set_vis_sources(
+                src,
+                names=[str(batch["subject_id"][0])] if "subject_id" in batch else None,
+            )
+            print("[VIS][WARN] vis_source_image / set_vis_sources not set; using first training batch hint.")
 
         step = int(self.global_step)
-        n_yaw = len(self.vis_yaws_deg)
-        delta_pose = torch.tensor(
-            [[0.0, math.radians(y), 0.0] for y in self.vis_yaws_deg], device=self.device
-        )
-        sampler = self.sampler
+        source_pils = self._vis_source_pils
+        if source_pils is None:
+            source_pils = [self._hint_tensor_to_pil(t) for t in self._vis_sources]
+
         unet = self.model.diffusion_model
         was_training = unet.training
         unet.eval()
+        normal_gt_and_preds = []
         try:
             with torch.no_grad():
-                c_text = self.get_learned_conditioning([""] * n_yaw)
                 wandb_images = []
-                for src, name in zip(self._vis_sources, self._vis_names):
-                    src = src.unsqueeze(0).to(self.device)
-                    src_latent = self.encode_first_stage(src * 2 - 1).mode().detach()
-                    src_rep = src.repeat(n_yaw, 1, 1, 1)
-                    lat_rep = src_latent.repeat(n_yaw, 1, 1, 1)
-                    cond = {
-                        "c_crossattn": [c_text],
-                        "c_concat": [src_rep],
-                        "in_concat": [lat_rep],
-                        "delta_pose": delta_pose,
-                    }
-                    uc = {
-                        "c_crossattn": [c_text],
-                        "c_concat": [src_rep],
-                        "in_concat": [lat_rep * 0],
-                        "delta_pose": delta_pose,
-                    }
-                    # Same initial noise for every source, step, and yaw -> differences come only from the model.
-                    gen = torch.Generator(device=self.device).manual_seed(self.vis_seed)
-                    x_T = torch.randn(
-                        (1, *src_latent.shape[1:]), generator=gen, device=self.device
-                    ).repeat(n_yaw, 1, 1, 1)
-
-                    samples, _ = sampler.sample(
-                        S=self.vis_ddim_steps,
-                        batch_size=n_yaw,
-                        shape=list(src_latent.shape[1:]),
-                        conditioning=cond,
-                        verbose=False,
-                        x_T=x_T,
-                        unconditional_guidance_scale=self.vis_img_scale,
-                        unconditional_conditioning=uc,
-                        eta=0.0,
+                for src_pil, name in zip(source_pils, self._vis_names):
+                    preds = generate_batch(
+                        self,
+                        src_pil,
+                        prompt="",
+                        dy_list=list(self.vis_yaws_deg),
+                        h=self.vis_image_size,
+                        w=self.vis_image_size,
+                        ddim_steps=self.vis_ddim_steps,
+                        ddim_eta=0.0,
+                        img_scale=self.vis_img_scale,
+                        prompt_scale=self.vis_prompt_scale,
+                        precision=self.vis_precision,
+                        use_ema_scope=self.vis_use_ema_scope,
+                        shared_noise=True,
+                        seed=self.vis_seed,
                     )
-                    preds = torch.clamp((self.decode_first_stage(samples) + 1) / 2, 0, 1)
-
+                    src_show = np.asarray(src_pil.convert("RGB"), dtype=np.float32) / 255.0
+                    src_show = torch.from_numpy(src_show).permute(2, 0, 1)
                     wandb_images.append(wandb.Image(
-                        torch.clamp(src[0], 0, 1),
+                        src_show,
                         caption=f"Step {step} | {name} | SOURCE",
                     ))
                     for yaw_deg, pred in zip(self.vis_yaws_deg, preds):
+                        pred_t = torch.from_numpy(
+                            np.asarray(pred.convert("RGB"), dtype=np.float32) / 255.0
+                        ).permute(2, 0, 1)
                         wandb_images.append(wandb.Image(
-                            pred,
-                            caption=f"Step {step} | {name} | Yaw: {yaw_deg:g}° | cfg={self.vis_img_scale:g}",
+                            pred_t,
+                            caption=(
+                                f"Step {step} | {name} | Yaw: {yaw_deg:g}° | "
+                                f"cfg={self.vis_img_scale:g} | seed={self.vis_seed}"
+                            ),
                         ))
 
-                normal_gt_and_preds = []
                 if "normal" in batch and "normal_mask" in batch:
                     gt_n = batch["normal"][:1].to(self.device)
                     normal_gt_and_preds.append(wandb.Image(

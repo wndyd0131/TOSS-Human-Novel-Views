@@ -115,6 +115,7 @@ def _sample_multiview_on_toss(
     img_scale: float,
     shared_noise: bool = True,
     x_T: torch.Tensor | None = None,
+    seed: int | None = None,
 ) -> tuple[list[Image.Image], torch.Tensor | None]:
     """Batched DDIM sampling with optional shared initial noise across poses."""
     if not T_list:
@@ -170,7 +171,13 @@ def _sample_multiview_on_toss(
                     )
                 used_x_T = x_T if x_T.shape[0] == 1 else x_T[:1].clone()
             elif shared_noise:
-                used_x_T = torch.randn((1, *in_concat.shape[1:]), device=in_concat.device)
+                if seed is not None:
+                    gen = torch.Generator(device=in_concat.device).manual_seed(int(seed))
+                    used_x_T = torch.randn(
+                        (1, *in_concat.shape[1:]), generator=gen, device=in_concat.device
+                    )
+                else:
+                    used_x_T = torch.randn((1, *in_concat.shape[1:]), device=in_concat.device)
                 noise = used_x_T.repeat(n, 1, 1, 1)
             else:
                 used_x_T = None
@@ -235,6 +242,7 @@ def generate_batch(
     img_ucg: float = 0.05,
     shared_noise: bool = True,
     chunk_size: int | None = None,
+    seed: int | None = None,
 ) -> list[Image.Image]:
     """
     Batch novel-view generation for any toss-like object with ``model``,
@@ -287,6 +295,7 @@ def generate_batch(
             cond_im,
             chunk_T,
             x_T=shared_x_T if shared_noise else None,
+            seed=seed if shared_x_T is None else None,
             **sample_kwargs,
         )
         outputs.extend(chunk_out)
