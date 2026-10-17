@@ -132,6 +132,8 @@ class TossHumanDataset(Dataset):
         load_corr=True,
         preload_subject_arrays=False,
         image_size=256,
+        caption_filename="caption.txt",
+        load_caption=True,
     ):
         super().__init__()
         self.root_dir = root_dir
@@ -142,6 +144,9 @@ class TossHumanDataset(Dataset):
         self.load_normals = load_normals
         self.load_depth = load_depth
         self.load_corr = load_corr
+        self.caption_filename = caption_filename
+        self.load_caption = load_caption
+        self._caption_cache: dict[str, str] = {}
 
         self.corr_file = "correlation.npy"
         self.valid_file = "valid.npy"
@@ -237,6 +242,36 @@ class TossHumanDataset(Dataset):
             self._cache.preload(unique_sub_paths)
             print("[Dataset] Preload complete.")
 
+        if self.load_caption:
+            unique_sub_paths = sorted({s["sub_path"] for s in self.samples})
+            n_subjects = len(unique_sub_paths)
+            n_with_caption = sum(
+                1 for sp in unique_sub_paths if self._get_subject_caption(sp)
+            )
+            print(
+                f"[Dataset] Captions: {n_with_caption}/{n_subjects} subjects "
+                f"have non-empty {self.caption_filename}"
+            )
+
+    def _get_subject_caption(self, sub_path: str) -> str:
+        if not self.load_caption:
+            return ""
+        if sub_path in self._caption_cache:
+            return self._caption_cache[sub_path]
+
+        cap_path = os.path.join(sub_path, self.caption_filename)
+        caption = ""
+        if os.path.isfile(cap_path):
+            with open(cap_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        caption = line
+                        break
+
+        self._caption_cache[sub_path] = caption
+        return caption
+
     def __len__(self):
         return len(self.samples)
 
@@ -289,7 +324,7 @@ class TossHumanDataset(Dataset):
             "mask": mask,
             "delta_pose": delta_pose,
             "subject_id": os.path.basename(sub_path),
-            "txt": "",
+            "txt": self._get_subject_caption(sub_path),
         }
 
         if self.load_normals:
