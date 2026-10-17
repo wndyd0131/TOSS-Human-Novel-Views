@@ -105,7 +105,7 @@ model:
     finetune: True
     ucg_img: 0.05
 
-    lambda_corr: 0.0
+    lambda_corr: 0.05
     corr_flow_src_size: 32
 
     # Identity loss (ArcFace)
@@ -121,6 +121,11 @@ model:
     # DISTS perceptual loss (image + Sobel)
     dists_loss_weight: 0.00
     dists_t_cut: 200
+
+    # WandB multiview preview (utils.inference.generate_batch; same path as Colab)
+    # vis_source_image: "/path/to/val/081/00003.png"
+    # vis_source_mask: "/path/to/val/081/alpha_maps/00003.png"
+    # vis_yaws_deg: [-15, -5, 5, 15]
 
     scheduler_config: # 10000 warmup steps
       target: ldm.lr_scheduler.LambdaLinearScheduler
