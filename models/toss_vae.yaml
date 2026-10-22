@@ -127,6 +127,9 @@ model:
     # vis_source_image: "/path/to/val/081/00003.png"
     # vis_source_mask: "/path/to/val/081/alpha_maps/00003.png"
     # vis_yaws_deg: [-15, -5, 5, 15]
+    # GT recon vis (same subject folder as vis_source_image; src view 3 -> targets below)
+    # vis_gt_view_indices: [2, 3, 15]
+    # vis_src_view_idx: 3
 
     scheduler_config: # 10000 warmup steps
       target: ldm.lr_scheduler.LambdaLinearScheduler

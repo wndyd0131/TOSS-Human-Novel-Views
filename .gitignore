@@ -170,3 +170,4 @@ wandb/
 !datasets/scripts/
 notebooks/
 .DS_Store
+docs/
