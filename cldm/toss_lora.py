@@ -111,6 +111,8 @@ class TossLoraModule(TOSS):
         vis_use_ema_scope=False,
         vis_source_image=None,
         vis_source_mask=None,
+        vis_data_root=None,
+        vis_subject_ids=None,
         vis_gt_view_indices=(2, 3, 15),
         vis_src_view_idx=3,
         vis_gt_enabled=True,
@@ -152,6 +154,9 @@ class TossLoraModule(TOSS):
         self.vis_use_ema_scope = bool(kwargs.pop("vis_use_ema_scope", vis_use_ema_scope))
         self.vis_source_image = kwargs.pop("vis_source_image", vis_source_image)
         self.vis_source_mask = kwargs.pop("vis_source_mask", vis_source_mask)
+        self.vis_data_root = kwargs.pop("vis_data_root", vis_data_root)
+        subj_ids = kwargs.pop("vis_subject_ids", vis_subject_ids)
+        self.vis_subject_ids = [str(s) for s in subj_ids] if subj_ids else None
         gt_indices = kwargs.pop("vis_gt_view_indices", vis_gt_view_indices)
         self.vis_gt_view_indices = [int(v) for v in gt_indices] if gt_indices else []
         self.vis_src_view_idx = int(kwargs.pop("vis_src_view_idx", vis_src_view_idx))
@@ -169,8 +174,8 @@ class TossLoraModule(TOSS):
         self._vis_sources = None
         self._vis_names = None
         self._vis_source_pils = None
-        self._vis_gt_items = None
-        self._vis_gt_subject_name = None
+        self._vis_subject_ids = None
+        self._vis_gt_bundles = None
 
         global run
         kst = pytz.timezone("Asia/Seoul")
@@ -371,36 +376,33 @@ class TossLoraModule(TOSS):
         self._vis_sources = hint.unsqueeze(0)
         print(f"[VIS] Fixed source from disk: {name}")
 
-    def _load_vis_gt_from_subject(self):
-        """Load GT target views and delta poses from the vis source subject folder."""
-        from utils.image import preprocess_image
-        from utils.pose import compute_relative_pose
-
-        self._vis_gt_items = None
-        self._vis_gt_subject_name = None
-        if not self.vis_gt_enabled or not self.vis_gt_view_indices:
-            return
-        if not self.vis_source_image:
-            print("[VIS][WARN] vis_source_image unset; skipping GT recon visualization.")
-            return
-
-        subject_dir = os.path.dirname(os.path.abspath(self.vis_source_image))
+    @staticmethod
+    def _load_poses_npy(subject_dir: str):
         poses_path = os.path.join(subject_dir, "poses.npy")
         if not os.path.isfile(poses_path):
-            print(f"[VIS][WARN] Missing {poses_path}; skipping GT recon visualization.")
-            return
-
+            return None
         poses = np.load(poses_path)
         if poses.ndim == 2 and poses.shape[1] == 16:
             poses = poses.reshape(-1, 4, 4)
+        return poses
+
+    def _gt_items_for_subject_dir(self, subject_dir: str):
+        """Return list of (view_idx, delta, gt_pil, gt_mask) for one subject folder."""
+        from utils.image import preprocess_image
+        from utils.pose import compute_relative_pose
+
+        poses = self._load_poses_npy(subject_dir)
+        if poses is None:
+            print(f"[VIS][WARN] Missing poses.npy under {subject_dir}; skip GT for this subject.")
+            return []
 
         src_idx = self.vis_src_view_idx
         if src_idx < 0 or src_idx >= len(poses):
             print(
-                f"[VIS][WARN] vis_src_view_idx={src_idx} out of range "
-                f"(num_views={len(poses)}); skipping GT recon visualization."
+                f"[VIS][WARN] vis_src_view_idx={src_idx} out of range for {subject_dir} "
+                f"(num_views={len(poses)})."
             )
-            return
+            return []
 
         items = []
         for view_idx in self.vis_gt_view_indices:
@@ -409,11 +411,11 @@ class TossLoraModule(TOSS):
             mask_path = os.path.join(subject_dir, "alpha_maps", f"{view_idx:05d}.png")
             if not os.path.isfile(img_path) or not os.path.isfile(mask_path):
                 print(
-                    f"[VIS][WARN] Missing GT view {view_idx:05d} under {subject_dir}; skipping that view."
+                    f"[VIS][WARN] Missing GT view {view_idx:05d} under {subject_dir}; skip that view."
                 )
                 continue
             if view_idx < 0 or view_idx >= len(poses):
-                print(f"[VIS][WARN] view_idx={view_idx} out of range for poses; skipping that view.")
+                print(f"[VIS][WARN] view_idx={view_idx} out of range for {subject_dir}; skip.")
                 continue
 
             delta = compute_relative_pose(poses[src_idx], poses[view_idx]).astype(np.float32)
@@ -422,24 +424,108 @@ class TossLoraModule(TOSS):
             gt_arr = preprocess_image(gt_img, fg_mask=gt_mask, size=self.vis_image_size)
             gt_pil = Image.fromarray(np.clip(gt_arr * 255.0, 0, 255).astype(np.uint8))
             items.append((view_idx, delta, gt_pil, gt_mask))
+        return items
 
-        if not items:
-            print(f"[VIS][WARN] No valid GT recon views under {subject_dir}.")
+    def _subject_dir_for_id(self, subject_id: str) -> str:
+        root = os.path.abspath(self.vis_data_root)
+        return os.path.join(root, str(subject_id))
+
+    def _vis_gt_subject_id_list(self):
+        if self.vis_subject_ids:
+            return list(self.vis_subject_ids)
+        if self._vis_subject_ids:
+            return list(self._vis_subject_ids)
+        if self.vis_data_root and self._vis_names:
+            return [str(n) for n in self._vis_names]
+        return []
+
+    def _build_vis_gt_bundles(self):
+        """One bundle per subject: {subject_name, items}. Same subjects as yaw vis when possible."""
+        if not self.vis_gt_enabled or not self.vis_gt_view_indices:
+            return []
+
+        bundles = []
+        for subject_id in self._vis_gt_subject_id_list():
+            subject_dir = self._subject_dir_for_id(subject_id)
+            if not os.path.isdir(subject_dir):
+                print(f"[VIS][WARN] Subject dir not found: {subject_dir}; skip GT.")
+                continue
+            items = self._gt_items_for_subject_dir(subject_dir)
+            if items:
+                view_ids = [v for v, _, _, _ in items]
+                print(
+                    f"[VIS] GT recon subject {subject_id} (src view {self.vis_src_view_idx}): "
+                    f"targets {view_ids}"
+                )
+                bundles.append({"subject_name": str(subject_id), "items": items})
+
+        if bundles:
+            return bundles
+
+        if self.vis_source_image:
+            subject_dir = os.path.dirname(os.path.abspath(self.vis_source_image))
+            items = self._gt_items_for_subject_dir(subject_dir)
+            if items:
+                name = os.path.basename(subject_dir.rstrip(os.sep))
+                view_ids = [v for v, _, _, _ in items]
+                print(
+                    f"[VIS] GT recon from vis_source_image subject {name} "
+                    f"(src view {self.vis_src_view_idx}): targets {view_ids}"
+                )
+                return [{"subject_name": name, "items": items}]
+
+        if not self._vis_gt_subject_id_list() and not self.vis_source_image:
+            print(
+                "[VIS][WARN] GT recon needs vis_data_root + vis_subject_ids (or set_vis_sources "
+                "subject_ids / names), or vis_source_image."
+            )
+        return []
+
+    def _ensure_vis_gt_bundles(self):
+        if self._vis_gt_bundles is None:
+            self._vis_gt_bundles = self._build_vis_gt_bundles()
+        elif not self._vis_gt_bundles and self._vis_gt_subject_id_list():
+            self._vis_gt_bundles = self._build_vis_gt_bundles()
+        return self._vis_gt_bundles
+
+    def _load_vis_sources_from_dataset_root(self):
+        """Load fixed yaw sources from ``vis_data_root`` / ``vis_subject_ids`` (same as GT subjects)."""
+        from utils.image import preprocess_image
+
+        if not self.vis_data_root or not self.vis_subject_ids:
+            return
+        if self._vis_source_pils is not None:
             return
 
-        self._vis_gt_subject_name = os.path.basename(subject_dir.rstrip(os.sep))
-        self._vis_gt_items = items
-        view_ids = [v for v, _, _, _ in items]
-        print(
-            f"[VIS] GT recon from subject {self._vis_gt_subject_name} "
-            f"(src view {src_idx}): target views {view_ids}"
-        )
+        hints = []
+        names = []
+        src_idx = self.vis_src_view_idx
+        for subject_id in self.vis_subject_ids:
+            subject_dir = self._subject_dir_for_id(subject_id)
+            img_path = os.path.join(subject_dir, f"{src_idx:05d}.png")
+            mask_path = os.path.join(subject_dir, "alpha_maps", f"{src_idx:05d}.png")
+            if not os.path.isfile(img_path):
+                print(f"[VIS][WARN] Missing source {img_path}; skip vis subject {subject_id}.")
+                continue
+            mask = Image.open(mask_path).convert("L") if os.path.isfile(mask_path) else None
+            img = Image.open(img_path).convert("RGBA")
+            arr = preprocess_image(img, fg_mask=mask, size=self.vis_image_size)
+            hints.append(torch.from_numpy(arr).permute(2, 0, 1).float())
+            names.append(str(subject_id))
+
+        if not hints:
+            print("[VIS][WARN] No vis sources loaded from vis_data_root / vis_subject_ids.")
+            return
+
+        self.set_vis_sources(torch.stack(hints, dim=0), names=names, subject_ids=names)
+        print(f"[VIS] Loaded {len(names)} yaw/GT source(s) from {self.vis_data_root}")
 
     def on_train_start(self):
         """Called by PyTorch Lightning when training starts - log trainer config"""
         self._trainable_params = [p for p in self.parameters() if p.requires_grad]
         self._load_vis_source_from_paths()
-        self._load_vis_gt_from_subject()
+        self._load_vis_sources_from_dataset_root()
+        self._ensure_vis_gt_bundles()
         if run is not None and self.trainer is not None:
             run.config.update({
                 "max_epochs": self.trainer.max_epochs,
@@ -636,18 +722,26 @@ class TossLoraModule(TOSS):
 
         return loss_corr, log
 
-    def set_vis_sources(self, images, names=None):
+    def set_vis_sources(self, images, names=None, subject_ids=None):
         """Fix the source faces used for training-time multiview visualization.
 
         images: [N, 3, H, W] (or [N, H, W, 3]) in [0, 1], same layout as the dataset's "hint".
+        subject_ids: optional folder names under ``vis_data_root`` for GT recon (defaults to ``names``).
         """
         if images.ndim == 4 and images.shape[-1] == 3:
             images = einops.rearrange(images, "b h w c -> b c h w")
         self._vis_sources = images.detach().float().cpu().clone()
         self._vis_names = list(names) if names is not None else [str(i) for i in range(images.shape[0])]
+        if subject_ids is not None:
+            self._vis_subject_ids = [str(s) for s in subject_ids]
+        elif self.vis_data_root:
+            self._vis_subject_ids = list(self._vis_names)
+        else:
+            self._vis_subject_ids = None
         self._vis_source_pils = [
             self._hint_tensor_to_pil(self._vis_sources[i]) for i in range(self._vis_sources.shape[0])
         ]
+        self._vis_gt_bundles = None
         print(f"[VIS] Fixed {len(self._vis_names)} visualization source(s): {self._vis_names}")
 
     def _log_multiview_vis(self, batch, wandb_log):
@@ -734,7 +828,8 @@ class TossLoraModule(TOSS):
 
     def _log_gt_recon_vis(self, wandb_log):
         """GT-aligned reconstructions via ``generate_batch(delta_pose_list=...)``."""
-        if not self._vis_gt_items:
+        bundles = self._ensure_vis_gt_bundles()
+        if not bundles:
             return
 
         from utils.eval_metrics import compute_psnr
@@ -748,84 +843,95 @@ class TossLoraModule(TOSS):
             print("[VIS][WARN] No vis source for GT recon; skipping.")
             return
 
-        src_pil = source_pils[0]
         step = int(self.global_step)
-        subject = self._vis_gt_subject_name or "subject"
-
         unet = self.model.diffusion_model
         was_training = unet.training
         unet.eval()
+        wandb_images = []
+        n_views = 0
         try:
             with torch.no_grad():
-                delta_pose_list = [d for _, d, _, _ in self._vis_gt_items]
-                preds = generate_batch(
-                    self,
-                    src_pil,
-                    prompt="",
-                    delta_pose_list=delta_pose_list,
-                    h=self.vis_image_size,
-                    w=self.vis_image_size,
-                    ddim_steps=self.vis_ddim_steps,
-                    ddim_eta=0.0,
-                    img_scale=self.vis_img_scale,
-                    prompt_scale=self.vis_prompt_scale,
-                    precision=self.vis_precision,
-                    use_ema_scope=self.vis_use_ema_scope,
-                    shared_noise=True,
-                    seed=self.vis_seed,
-                )
-
-                wandb_images = []
-                src_show = np.asarray(src_pil.convert("RGB"), dtype=np.float32) / 255.0
-                src_show = torch.from_numpy(src_show).permute(2, 0, 1)
-                wandb_images.append(wandb.Image(
-                    src_show,
-                    caption=(
-                        f"Step {step} | {subject} | SOURCE (view {self.vis_src_view_idx})"
-                    ),
-                ))
-
-                for (view_idx, delta, gt_pil, gt_mask_pil), pred in zip(
-                    self._vis_gt_items, preds
-                ):
-                    gt_t = torch.from_numpy(
-                        np.asarray(gt_pil.convert("RGB"), dtype=np.float32) / 255.0
-                    ).permute(2, 0, 1)
-                    pred_t = torch.from_numpy(
-                        np.asarray(pred.convert("RGB"), dtype=np.float32) / 255.0
-                    ).permute(2, 0, 1)
-                    pitch_deg = float(np.degrees(delta[0]))
-                    yaw_deg = float(np.degrees(delta[1]))
-                    dist = float(delta[2])
-                    pose_str = (
-                        f"Δpitch={pitch_deg:.2f}° Δyaw={yaw_deg:.2f}° Δdist={dist:.4f}"
+                for bundle_idx, bundle in enumerate(bundles):
+                    subject = bundle["subject_name"]
+                    items = bundle["items"]
+                    if bundle_idx >= len(source_pils):
+                        print(
+                            f"[VIS][WARN] No yaw source for GT subject {subject} "
+                            f"(index {bundle_idx}); skip."
+                        )
+                        continue
+                    src_pil = source_pils[bundle_idx]
+                    delta_pose_list = [d for _, d, _, _ in items]
+                    preds = generate_batch(
+                        self,
+                        src_pil,
+                        prompt="",
+                        delta_pose_list=delta_pose_list,
+                        h=self.vis_image_size,
+                        w=self.vis_image_size,
+                        ddim_steps=self.vis_ddim_steps,
+                        ddim_eta=0.0,
+                        img_scale=self.vis_img_scale,
+                        prompt_scale=self.vis_prompt_scale,
+                        precision=self.vis_precision,
+                        use_ema_scope=self.vis_use_ema_scope,
+                        shared_noise=True,
+                        seed=self.vis_seed,
                     )
+
+                    src_show = np.asarray(src_pil.convert("RGB"), dtype=np.float32) / 255.0
+                    src_show = torch.from_numpy(src_show).permute(2, 0, 1)
                     wandb_images.append(wandb.Image(
-                        gt_t,
-                        caption=f"Step {step} | {subject} | GT view {view_idx:05d} | {pose_str}",
-                    ))
-                    wandb_images.append(wandb.Image(
-                        pred_t,
+                        src_show,
                         caption=(
-                            f"Step {step} | {subject} | PRED view {view_idx:05d} | "
-                            f"{pose_str} | cfg={self.vis_img_scale:g} | seed={self.vis_seed}"
+                            f"Step {step} | {subject} | SOURCE (view {self.vis_src_view_idx})"
                         ),
                     ))
 
-                    gt_np = np.asarray(gt_pil.convert("RGB"), dtype=np.float32) / 255.0
-                    pred_np = preprocess_image(
-                        pred.convert("RGB"),
-                        fg_mask=gt_mask_pil,
-                        size=self.vis_image_size,
-                    )
-                    mask_np = resize_mask(gt_mask_pil, size=self.vis_image_size)
-                    fg_psnr = compute_psnr(pred_np, gt_np, mask=mask_np)
-                    wandb_log[f"vis_gt/fg_psnr_view_{view_idx}"] = fg_psnr
+                    for (view_idx, delta, gt_pil, gt_mask_pil), pred in zip(items, preds):
+                        gt_t = torch.from_numpy(
+                            np.asarray(gt_pil.convert("RGB"), dtype=np.float32) / 255.0
+                        ).permute(2, 0, 1)
+                        pred_t = torch.from_numpy(
+                            np.asarray(pred.convert("RGB"), dtype=np.float32) / 255.0
+                        ).permute(2, 0, 1)
+                        pitch_deg = float(np.degrees(delta[0]))
+                        yaw_deg = float(np.degrees(delta[1]))
+                        dist = float(delta[2])
+                        pose_str = (
+                            f"Δpitch={pitch_deg:.2f}° Δyaw={yaw_deg:.2f}° Δdist={dist:.4f}"
+                        )
+                        wandb_images.append(wandb.Image(
+                            gt_t,
+                            caption=(
+                                f"Step {step} | {subject} | GT view {view_idx:05d} | {pose_str}"
+                            ),
+                        ))
+                        wandb_images.append(wandb.Image(
+                            pred_t,
+                            caption=(
+                                f"Step {step} | {subject} | PRED view {view_idx:05d} | "
+                                f"{pose_str} | cfg={self.vis_img_scale:g} | seed={self.vis_seed}"
+                            ),
+                        ))
+
+                        gt_np = np.asarray(gt_pil.convert("RGB"), dtype=np.float32) / 255.0
+                        pred_np = preprocess_image(
+                            pred.convert("RGB"),
+                            fg_mask=gt_mask_pil,
+                            size=self.vis_image_size,
+                        )
+                        mask_np = resize_mask(gt_mask_pil, size=self.vis_image_size)
+                        fg_psnr = compute_psnr(pred_np, gt_np, mask=mask_np)
+                        wandb_log[f"vis_gt/fg_psnr_{subject}_view_{view_idx}"] = fg_psnr
+                        n_views += 1
         finally:
             unet.train(was_training)
 
         wandb_log["gt_recon_predictions"] = wandb_images
-        print(f"[VIS] Logged GT recon ({len(self._vis_gt_items)} views) at step {step}")
+        print(
+            f"[VIS] Logged GT recon ({len(bundles)} subject(s), {n_views} view(s)) at step {step}"
+        )
 
     def _compute_batch_loss(self, batch, *, decode_mode="train"):
         """Shared train/val loss: masked MSE + optional corr, identity, DISTS."""
