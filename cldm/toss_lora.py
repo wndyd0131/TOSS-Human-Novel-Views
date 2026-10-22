@@ -98,7 +98,7 @@ class TossLoraModule(TOSS):
         corr_embed_dim=128,
         corr_proj_trainable=True,
         corr_debug_steps=200,
-        corr_flow_src_size=512,
+        corr_flow_src_size=32,
         vis_every_n_steps=50,
         vis_yaws_deg=(-15, -5, 5, 15),
         vis_ddim_steps=30,
@@ -126,8 +126,8 @@ class TossLoraModule(TOSS):
         self.corr_embed_dim = int(kwargs.pop("corr_embed_dim", corr_embed_dim))
         self.corr_proj_trainable = bool(kwargs.pop("corr_proj_trainable", corr_proj_trainable))
         self.corr_debug_steps = int(kwargs.pop("corr_debug_steps", corr_debug_steps))
-        # flow_tgt2src.npy holds pixel coordinates in a (H_src, W_src) source image; set to None
-        # if the arrays are ever regenerated as normalized [-1, 1] grid_sample coords.
+        # corr_flow_src_size not None: flow_tgt2src is source latent indices (see correlation_gt_2).
+        # None: flow is already a grid_sample grid in [-1, 1].
         src_size = kwargs.pop("corr_flow_src_size", corr_flow_src_size)
         if src_size is None:
             self.corr_flow_src_size = None
@@ -254,7 +254,10 @@ class TossLoraModule(TOSS):
         self.corr_proj = nn.Conv2d(320, self.corr_embed_dim, kernel_size=1)
         self.corr_proj.requires_grad_(self.corr_proj_trainable)
         print(f"[INIT] corr_proj: 320 -> {self.corr_embed_dim} (trainable={self.corr_proj_trainable}, lambda_corr={self.lambda_corr})")
-        print(f"[INIT] corr flow source size: {self.corr_flow_src_size} (None = already normalized)")
+        print(
+            f"[INIT] corr flow: {self.corr_flow_src_size} "
+            f"(None = pre-normalized grid; else latent-index -> grid like correlation_gt_2)"
+        )
 
         # Forward hook captures the last output-block feature [2B, 320, 32, 32] each forward.
         # [:B] = target (noised) branch, [B:] = source branch (see apply_model batch-doubling).
@@ -441,25 +444,39 @@ class TossLoraModule(TOSS):
         p_src = F.normalize(self.corr_proj(f_src), dim=1)  # [B, D, Hf, Wf]
         feat_hw = p_tgt.shape[-2:]
 
-        # Warp projected source features into the target coordinate frame.
-        # flow_tgt2src: [B, Hf, Wf, 2], last dim = (x=width, y=height).
+        # Warp source features into the target frame (same ops as correlation_gt_2.correlation_for_pair).
         flow = batch["flow_tgt2src"].to(device=p_src.device, dtype=p_src.dtype)
-        if self.corr_flow_src_size is not None:
-            # Stored as pixel coords -> normalized coords. The half-pixel offset is the
-            # align_corners=False convention used by the grid_sample call below.
-            h_src, w_src = self.corr_flow_src_size
-            scale = flow.new_tensor([w_src, h_src])  # last dim is (x=width, y=height)
-            flow = (2.0 * flow + 1.0) / scale - 1.0
-        if flow.shape[1:3] != feat_hw:
-            # normalized coords are resolution-independent -> spatially resize the grid
-            flow = F.interpolate(flow.permute(0, 3, 1, 2), size=feat_hw, mode="bilinear", align_corners=False)
-            flow = flow.permute(0, 2, 3, 1).contiguous()
+        if flow.dim() == 3:
+            flow = flow.unsqueeze(0)
 
-        # Out-of-range coords silently sample as zeros under padding_mode="zeros", which kills the
-        # gradient without raising, so track how much of the supervised region actually gets sampled.
-        in_bounds = (flow.abs() <= 1.0).all(dim=-1).unsqueeze(1).float()  # [B, 1, Hf, Wf]
+        Hf, Wf = feat_hw
+        latent_denom = max(float(Hf), float(Wf)) - 1.0
+        if latent_denom < 1.0:
+            latent_denom = 1.0
 
-        warped_src = F.grid_sample(p_src, flow, mode="bilinear", padding_mode="zeros", align_corners=False)  # [B, D, Hf, Wf]
+        if self.corr_flow_src_size is None:
+            grid = flow
+        else:
+            grid = flow / latent_denom * 2.0 - 1.0
+
+        if grid.shape[1:3] != feat_hw:
+            grid = F.interpolate(
+                grid.permute(0, 3, 1, 2),
+                size=feat_hw,
+                mode="bilinear",
+                align_corners=True,
+            ).permute(0, 2, 3, 1).contiguous()
+
+        in_bounds = (grid.abs() <= 1.0).all(dim=-1).unsqueeze(1).float()  # [B, 1, Hf, Wf]
+
+        warped_src = F.grid_sample(
+            p_src,
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
+        warped_src = F.normalize(warped_src, dim=1)
 
         corr_pred = (warped_src * p_tgt).sum(dim=1, keepdim=True)  # [B, 1, Hf, Wf]
 
@@ -512,10 +529,10 @@ class TossLoraModule(TOSS):
         if not self._corr_flow_warned and in_bounds_ratio.item() < 0.5:
             self._corr_flow_warned = True
             print(
-                f"[WARN] Only {in_bounds_ratio.item():.1%} of supervised flow coords land inside [-1, 1] "
-                f"(flow min={flow.min().item():.3f}, max={flow.max().item():.3f}). "
-                f"grid_sample returns zeros outside, so corr gradients will be near zero. "
-                f"Check corr_flow_src_size (currently {self.corr_flow_src_size}) and the (x, y) channel order."
+                f"[WARN] Only {in_bounds_ratio.item():.1%} of supervised grid coords land inside [-1, 1] "
+                f"(grid min={grid.min().item():.3f}, max={grid.max().item():.3f}). "
+                f"Check flow_tgt2src convention (corr_flow_src_size={self.corr_flow_src_size}) "
+                f"and (x=width, y=height) channel order."
             )
 
         if debug:
@@ -532,7 +549,7 @@ class TossLoraModule(TOSS):
                     f"feat={tuple(feat.shape)} | "
                     f"f_tgt(mean={f_tgt.mean().item():.4f},std={f_tgt.std().item():.4f}) "
                     f"f_src(mean={f_src.mean().item():.4f},std={f_src.std().item():.4f}) | "
-                    f"flow(min={flow.min().item():.3f},max={flow.max().item():.3f},"
+                    f"grid(min={grid.min().item():.3f},max={grid.max().item():.3f},"
                     f"in_bounds@valid={in_bounds_ratio.item():.4f}) | "
                     f"warped_src_norm(mean={warped_norm.mean().item():.4f}) | "
                     f"corr_pred(min={corr_pred.min().item():.4f},mean={corr_pred.mean().item():.4f},max={corr_pred.max().item():.4f}) | "
