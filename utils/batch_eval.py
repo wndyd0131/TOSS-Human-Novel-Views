@@ -25,6 +25,7 @@ from utils.multiview_metrics import MultiviewMetricsEvaluator
 from utils.pose import (
     DEFAULT_RECON_VIEW_INDICES,
     compute_relative_pose,
+    delta_pose_for_yaw_degrees,
     identity_dy_grid,
     select_horizontal_views,
     select_recon_views,
@@ -694,29 +695,17 @@ def _generate_batch(
     toss,
     src_input: Image.Image,
     *,
-    delta_pose_list: list[np.ndarray] | None = None,
-    dy_list: list[float] | None = None,
+    delta_pose_list: list[np.ndarray],
     eval_gen_batch_size: int | None = None,
 ) -> list[Image.Image]:
-    if delta_pose_list is not None:
-        return generate_batch(
-            toss,
-            src_input,
-            prompt="",
-            delta_pose_list=delta_pose_list,
-            shared_noise=True,
-            chunk_size=eval_gen_batch_size,
-        )
-    if dy_list is not None:
-        return generate_batch(
-            toss,
-            src_input,
-            prompt="",
-            dy_list=dy_list,
-            shared_noise=True,
-            chunk_size=eval_gen_batch_size,
-        )
-    raise ValueError("pass delta_pose_list or dy_list")
+    return generate_batch(
+        toss,
+        src_input,
+        prompt="",
+        delta_pose_list=delta_pose_list,
+        shared_noise=True,
+        chunk_size=eval_gen_batch_size,
+    )
 
 
 def _load_subject_rgba(
@@ -995,10 +984,14 @@ def run_batch_eval(
                         )
 
         if run_sweep:
+            delta_pose_list = [
+                delta_pose_for_yaw_degrees(poses[src_view_idx], yaw_deg)
+                for yaw_deg in dy_grid
+            ]
             id_pils = _generate_batch(
                 toss,
                 src_input,
-                dy_list=dy_grid,
+                delta_pose_list=delta_pose_list,
                 eval_gen_batch_size=eval_gen_batch_size,
             )
 

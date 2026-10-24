@@ -54,7 +54,7 @@ def compute_relative_pose(
     tgt_pitch, tgt_yaw = rotation_matrix_to_euler(tgt_pose_4x4[:3, :3])
 
     delta_pitch = _wrap_angle(tgt_pitch - src_pitch)
-    delta_yaw = -_wrap_angle(tgt_yaw - src_yaw)
+    delta_yaw = _wrap_angle(tgt_yaw - src_yaw)
 
     src_dist = float(np.linalg.norm(src_pose_4x4[:3, 3]))
     tgt_dist = float(np.linalg.norm(tgt_pose_4x4[:3, 3]))
@@ -63,6 +63,57 @@ def compute_relative_pose(
         [delta_pitch, delta_yaw, tgt_dist - src_dist],
         dtype=np.float32,
     )
+
+
+def _rotation_from_pitch_yaw(pitch: float, yaw: float) -> np.ndarray:
+    """Rotation matrix for ``R = Ry(yaw) @ Rx(pitch)`` (roll = 0)."""
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    rx = np.array([[1.0, 0.0, 0.0], [0.0, cp, -sp], [0.0, sp, cp]], dtype=np.float64)
+    ry = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=np.float64)
+    return ry @ rx
+
+
+def synthesize_target_pose(
+    src_pose_4x4: np.ndarray,
+    delta_pitch_deg: float = 0.0,
+    delta_yaw_deg: float = 0.0,
+    delta_dist: float = 0.0,
+) -> np.ndarray:
+    """Target 4×4 from relative pitch/yaw (degrees) and distance offset vs source."""
+    src_pose_4x4 = np.asarray(src_pose_4x4, dtype=np.float64)
+    src_pitch, src_yaw = rotation_matrix_to_euler(src_pose_4x4[:3, :3])
+    src_dist = float(np.linalg.norm(src_pose_4x4[:3, 3]))
+
+    tgt_pitch = _wrap_angle(src_pitch + np.radians(float(delta_pitch_deg)))
+    tgt_yaw = _wrap_angle(src_yaw + np.radians(float(delta_yaw_deg)))
+    tgt_dist = max(src_dist + float(delta_dist), 1e-6)
+
+    tgt = np.eye(4, dtype=np.float32)
+    tgt[:3, :3] = _rotation_from_pitch_yaw(tgt_pitch, tgt_yaw).astype(np.float32)
+    t_src = src_pose_4x4[:3, 3]
+    if src_dist > 1e-8:
+        tgt[:3, 3] = (t_src / src_dist * tgt_dist).astype(np.float32)
+    else:
+        tgt[:3, 3] = np.array([0.0, 0.0, tgt_dist], dtype=np.float32)
+    return tgt
+
+
+def delta_pose_for_yaw_degrees(
+    src_pose_4x4: np.ndarray,
+    yaw_deg: float,
+    delta_pitch_deg: float = 0.0,
+    delta_dist: float = 0.0,
+) -> np.ndarray:
+    """Training-format ``[Δpitch, Δyaw, Δdist]`` (rad) for a yaw sweep from ``src_pose``."""
+    src_pose_4x4 = np.asarray(src_pose_4x4, dtype=np.float32)
+    tgt_pose = synthesize_target_pose(
+        src_pose_4x4,
+        delta_pitch_deg=delta_pitch_deg,
+        delta_yaw_deg=yaw_deg,
+        delta_dist=delta_dist,
+    )
+    return compute_relative_pose(src_pose_4x4, tgt_pose)
 
 
 def select_recon_views(

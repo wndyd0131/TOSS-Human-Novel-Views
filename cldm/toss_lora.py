@@ -430,6 +430,30 @@ class TossLoraModule(TOSS):
         root = os.path.abspath(self.vis_data_root)
         return os.path.join(root, str(subject_id))
 
+    def _subject_dir_for_vis_name(self, name: str) -> str | None:
+        """Subject folder containing ``poses.npy`` for multiview vis (matches GT recon)."""
+        if self.vis_data_root:
+            candidate = self._subject_dir_for_id(name)
+            if os.path.isdir(candidate) and os.path.isfile(
+                os.path.join(candidate, "poses.npy")
+            ):
+                return candidate
+            if os.path.isfile(name):
+                subject_dir = os.path.dirname(os.path.abspath(name))
+                if os.path.isfile(os.path.join(subject_dir, "poses.npy")):
+                    return subject_dir
+            basename = os.path.basename(str(name).rstrip(os.sep))
+            candidate = self._subject_dir_for_id(basename)
+            if os.path.isdir(candidate) and os.path.isfile(
+                os.path.join(candidate, "poses.npy")
+            ):
+                return candidate
+        if self.vis_source_image:
+            subject_dir = os.path.dirname(os.path.abspath(self.vis_source_image))
+            if os.path.isfile(os.path.join(subject_dir, "poses.npy")):
+                return subject_dir
+        return None
+
     def _vis_gt_subject_id_list(self):
         if self.vis_subject_ids:
             return list(self.vis_subject_ids)
@@ -747,6 +771,7 @@ class TossLoraModule(TOSS):
     def _log_multiview_vis(self, batch, wandb_log):
         """Sample fixed sources via ``utils.inference.generate_batch`` (Colab / eval path)."""
         from utils.inference import generate_batch
+        from utils.pose import delta_pose_for_yaw_degrees
 
         if self._vis_sources is None and self._vis_source_pils is None:
             src = batch[self.control_key][:1]
@@ -769,11 +794,43 @@ class TossLoraModule(TOSS):
             with torch.no_grad():
                 wandb_images = []
                 for src_pil, name in zip(source_pils, self._vis_names):
+                    src_show = np.asarray(src_pil.convert("RGB"), dtype=np.float32) / 255.0
+                    src_show = torch.from_numpy(src_show).permute(2, 0, 1)
+                    wandb_images.append(wandb.Image(
+                        src_show,
+                        caption=f"Step {step} | {name} | SOURCE",
+                    ))
+
+                    subject_dir = self._subject_dir_for_vis_name(name)
+                    if subject_dir is None:
+                        print(
+                            "[VIS][WARN] No poses.npy for multiview vis "
+                            f"(name={name}); set vis_data_root or vis_source_image. Skip preds."
+                        )
+                        continue
+                    poses = self._load_poses_npy(subject_dir)
+                    if poses is None:
+                        print(
+                            f"[VIS][WARN] Missing poses.npy under {subject_dir}; skip preds."
+                        )
+                        continue
+                    src_idx = self.vis_src_view_idx
+                    if src_idx < 0 or src_idx >= len(poses):
+                        print(
+                            f"[VIS][WARN] vis_src_view_idx={src_idx} out of range "
+                            f"(num_views={len(poses)}); skip preds."
+                        )
+                        continue
+                    src_pose = poses[src_idx]
+                    delta_pose_list = [
+                        delta_pose_for_yaw_degrees(src_pose, yaw_deg)
+                        for yaw_deg in self.vis_yaws_deg
+                    ]
                     preds = generate_batch(
                         self,
                         src_pil,
                         prompt="",
-                        dy_list=list(self.vis_yaws_deg),
+                        delta_pose_list=delta_pose_list,
                         h=self.vis_image_size,
                         w=self.vis_image_size,
                         ddim_steps=self.vis_ddim_steps,
@@ -785,12 +842,6 @@ class TossLoraModule(TOSS):
                         shared_noise=True,
                         seed=self.vis_seed,
                     )
-                    src_show = np.asarray(src_pil.convert("RGB"), dtype=np.float32) / 255.0
-                    src_show = torch.from_numpy(src_show).permute(2, 0, 1)
-                    wandb_images.append(wandb.Image(
-                        src_show,
-                        caption=f"Step {step} | {name} | SOURCE",
-                    ))
                     for yaw_deg, pred in zip(self.vis_yaws_deg, preds):
                         pred_t = torch.from_numpy(
                             np.asarray(pred.convert("RGB"), dtype=np.float32) / 255.0

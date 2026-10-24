@@ -14,7 +14,7 @@ from pytorch_lightning import seed_everything
 from torch import autocast
 from torchvision import transforms
 
-from app import get_T_from_relative, load_model
+from app import load_model
 from ldm.models.diffusion.ddim import DDIMSampler
 from utils.image import preprocess_image
 
@@ -63,17 +63,15 @@ def _resolve_pl_module(toss):
 def _resolve_generate_defaults(
     toss,
     *,
-    pose_enc: str | None,
     h: int | None,
     w: int | None,
     use_ema_scope: bool | None,
-) -> tuple[int, int, str, bool]:
+) -> tuple[int, int, bool]:
     h = getattr(toss, "_default_h", 256) if h is None else h
     w = getattr(toss, "_default_w", 256) if w is None else w
-    pose_enc = getattr(toss, "_default_pose_enc", "freq") if pose_enc is None else pose_enc
     if use_ema_scope is None:
         use_ema_scope = getattr(toss, "_default_use_ema_scope", True)
-    return h, w, pose_enc, use_ema_scope
+    return h, w, use_ema_scope
 
 
 def _prepare_cond_im_on_toss(
@@ -202,23 +200,11 @@ def _sample_multiview_on_toss(
     return _tensors_to_pils(x_samples), used_x_T
 
 
-def _build_pose_tensors(
-    *,
-    delta_pose_list: list[np.ndarray] | None,
-    dy_list: list[float] | None,
-    pose_enc: str,
-) -> list[torch.Tensor]:
-    if delta_pose_list is not None:
-        return [
-            _tensor_from_pose(np.asarray(delta_pose, dtype=np.float32).reshape(3))
-            for delta_pose in delta_pose_list
-        ]
-    if dy_list is not None:
-        return [
-            get_T_from_relative(0.0, float(yaw_deg), 0.0, pose_enc)
-            for yaw_deg in dy_list
-        ]
-    raise ValueError("pass delta_pose_list or dy_list")
+def _delta_pose_tensors(delta_pose_list: list[np.ndarray]) -> list[torch.Tensor]:
+    return [
+        _tensor_from_pose(np.asarray(delta_pose, dtype=np.float32).reshape(3))
+        for delta_pose in delta_pose_list
+    ]
 
 
 @torch.no_grad()
@@ -227,9 +213,7 @@ def generate_batch(
     image: ImageInputLike,
     prompt: str = "",
     *,
-    delta_pose_list: Optional[list[np.ndarray]] = None,
-    dy_list: Optional[list[float]] = None,
-    pose_enc: str | None = None,
+    delta_pose_list: list[np.ndarray],
     h: int | None = None,
     w: int | None = None,
     precision: str = "autocast",
@@ -245,31 +229,22 @@ def generate_batch(
     seed: int | None = None,
 ) -> list[Image.Image]:
     """
-    Batch novel-view generation for any toss-like object with ``model``,
-    ``sampler``, ``device``, and optional ``_default_*`` attrs.
-
-    Uses batched DDIM with shared ``x_T`` by default (notebook / wandb vis style).
+    Batch novel-view generation. Each entry in ``delta_pose_list`` is training-format
+    ``[delta_pitch, delta_yaw, delta_distance]`` in radians (see ``compute_relative_pose``).
     """
     del n_samples, img_ucg  # kept for API compatibility
 
-    if delta_pose_list is not None and dy_list is not None:
-        raise ValueError("pass only one of delta_pose_list or dy_list")
-    if delta_pose_list is None and dy_list is None:
-        raise ValueError("pass delta_pose_list or dy_list")
+    if not delta_pose_list:
+        raise ValueError("delta_pose_list must be non-empty")
 
-    h, w, pose_enc, use_ema_scope = _resolve_generate_defaults(
+    h, w, use_ema_scope = _resolve_generate_defaults(
         toss,
-        pose_enc=pose_enc,
         h=h,
         w=w,
         use_ema_scope=use_ema_scope,
     )
     cond_im = _prepare_cond_im_on_toss(toss, image, h, w)
-    T_list = _build_pose_tensors(
-        delta_pose_list=delta_pose_list,
-        dy_list=dy_list,
-        pose_enc=pose_enc,
-    )
+    T_list = _delta_pose_tensors(delta_pose_list)
 
     sample_kwargs = dict(
         prompt=prompt,
@@ -356,13 +331,9 @@ class TossInference:
         self,
         image: ImageInputLike,
         prompt: str = "",
-        dx: float = 0.0,
-        dy: float = 0.0,
-        dz: float = 0.0,
         *,
+        delta_pose: Optional[Sequence[float]] = None,
         delta_pose_list: Optional[list[np.ndarray]] = None,
-        dy_list: Optional[list[float]] = None,
-        pose_enc: str | None = None,
         h: int | None = None,
         w: int | None = None,
         precision: str = "autocast",
@@ -375,26 +346,18 @@ class TossInference:
         img_ucg: float = 0.05,
         shared_noise: bool = True,
         chunk_size: int | None = None,
+        seed: int | None = None,
     ) -> Union[Image.Image, list[Image.Image]]:
         """
-        Novel view synthesis for one image or a batch of poses.
-
-        Single pose: pass ``dx``, ``dy``, ``dz`` (degrees / distance via
-        ``get_T_from_relative``).
-
-        Batch reconstruction poses: pass ``delta_pose_list`` of shape-(3,)
-        arrays in radians ``[pitch, yaw, distance]`` (training format).
-
-        Batch yaw-only poses: pass ``dy_list`` of yaw degrees.
+        Novel view synthesis. Pass ``delta_pose`` (single, rad) or ``delta_pose_list``
+        (batch). Use ``utils.pose.compute_relative_pose`` upstream to build deltas.
         """
-        if delta_pose_list is not None or dy_list is not None:
-            return generate_batch(
+        if delta_pose_list is not None:
+            images = generate_batch(
                 self,
                 image,
                 prompt=prompt,
                 delta_pose_list=delta_pose_list,
-                dy_list=dy_list,
-                pose_enc=pose_enc,
                 h=h,
                 w=w,
                 precision=precision,
@@ -407,30 +370,30 @@ class TossInference:
                 img_ucg=img_ucg,
                 shared_noise=shared_noise,
                 chunk_size=chunk_size,
+                seed=seed,
             )
+            return images if len(images) > 1 else images[0]
 
-        h, w, pose_enc, use_ema_scope = _resolve_generate_defaults(
+        if delta_pose is None:
+            raise ValueError("pass delta_pose or delta_pose_list")
+
+        delta_arr = np.asarray(delta_pose, dtype=np.float32).reshape(3)
+        images = generate_batch(
             self,
-            pose_enc=pose_enc,
-            h=h,
-            w=w,
-            use_ema_scope=use_ema_scope,
-        )
-        cond_im = _prepare_cond_im_on_toss(self, image, h, w)
-        T = get_T_from_relative(dx, dy, dz, pose_enc)
-        images, _ = _sample_multiview_on_toss(
-            self,
-            cond_im,
-            [T],
+            image,
             prompt=prompt,
+            delta_pose_list=[delta_arr],
             h=h,
             w=w,
             precision=precision,
+            n_samples=n_samples,
             use_ema_scope=use_ema_scope,
             ddim_steps=ddim_steps,
             ddim_eta=ddim_eta,
             prompt_scale=prompt_scale,
             img_scale=img_scale,
+            img_ucg=img_ucg,
             shared_noise=shared_noise,
+            seed=seed,
         )
         return images[0]
