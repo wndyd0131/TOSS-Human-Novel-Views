@@ -14,6 +14,7 @@ import torch
 from PIL import Image
 
 from utils.eval_metrics import ImageMetricsEvaluator
+from utils.pointcloud_metrics import compare_fused_ply_files, resolve_fused_ply
 from utils.head_pose import (
     HeadPoseEstimator,
     calibrate_pose_estimator_on_gt,
@@ -51,6 +52,12 @@ def _init_metric_buckets() -> dict[str, list[float]]:
         "gt_mv_warp_error": [],
         "pose_yaw_error": [],
         "pose_pitch_leak": [],
+        "chamfer_l2": [],
+        "chamfer_l2_pred_to_gt": [],
+        "chamfer_l2_gt_to_pred": [],
+        "pointcloud_f1": [],
+        "pointcloud_precision": [],
+        "pointcloud_recall": [],
     }
 
 
@@ -58,10 +65,19 @@ _RECON_METRIC_KEYS = ("psnr", "fg_psnr", "lpips", "fg_lpips")
 _IDENTITY_METRIC_KEYS = ("identity",)
 _MV_METRIC_KEYS = ("mv_warp_error", "gt_mv_warp_error")
 _POSE_METRIC_KEYS = ("pose_yaw_error", "pose_pitch_leak")
+_POINTCLOUD_METRIC_KEYS = (
+    "chamfer_l2",
+    "chamfer_l2_pred_to_gt",
+    "chamfer_l2_gt_to_pred",
+    "pointcloud_f1",
+    "pointcloud_precision",
+    "pointcloud_recall",
+)
 
 _CSV_SUMMARY_HEADER = (
     "timestamp",
     "checkpoint",
+    "eval_kind",
     "num_subjects",
     "recon_n",
     "psnr",
@@ -74,11 +90,17 @@ _CSV_SUMMARY_HEADER = (
     "gt_mv_warp_error",
     "pose_yaw_error",
     "pose_pitch_leak",
+    "chamfer_l2",
+    "pointcloud_f1",
+    "gt_colmap_root",
+    "pred_colmap_root",
+    "colmap_workspace",
     "src_view_idx",
     "recon_view_indices",
     "identity_num_yaws",
 )
 _EVAL_STATE_VERSION = 2
+_POINTCLOUD_EVAL_STATE_VERSION = 3
 _EVAL_STATE_FILENAME = "eval_state.json"
 
 
@@ -282,6 +304,37 @@ def format_batch_eval_summary(
             f"n={results.metadata.get('pose_estimator_gt_n', 0)}"
         )
 
+    if results.overall.get("chamfer_l2"):
+        if results.metadata.get("f1_threshold") is not None:
+            lines.append(
+                f"\n=== Point cloud eval (fused.ply) | F1 threshold τ="
+                f"{results.metadata['f1_threshold']:.6g} ==="
+            )
+        else:
+            lines.append("\n=== Point cloud eval (fused.ply) ===")
+        lines.append("\n--- Per-subject ---")
+        for subject in test_subjects:
+            subject = str(subject)
+            sub = results.per_subject.get(subject, {})
+            if not sub.get("chamfer_l2"):
+                continue
+            msg = (
+                f"{subject}: chamfer_l2={np.mean(sub['chamfer_l2']):.6f}"
+            )
+            if sub.get("pointcloud_f1"):
+                msg += f" | F1={np.mean(sub['pointcloud_f1']):.4f}"
+            lines.append(msg)
+        lines.append(
+            f"\n--- Overall (micro-average over subjects) ---\n"
+            f"chamfer_l2={np.mean(results.overall['chamfer_l2']):.6f} "
+            f"(n={len(results.overall['chamfer_l2'])})"
+        )
+        if results.overall.get("pointcloud_f1"):
+            lines.append(
+                f"pointcloud_f1={np.mean(results.overall['pointcloud_f1']):.4f} "
+                f"(n={len(results.overall['pointcloud_f1'])})"
+            )
+
     return "\n".join(lines)
 
 
@@ -356,8 +409,14 @@ def _results_from_serializable(data: dict[str, Any]) -> BatchEvalResults:
 
     overall = _init_metric_buckets()
     for key, values in data.get("overall", {}).items():
-        if key in overall:
-            overall[key] = list(values)
+        if key not in overall:
+            overall[key] = []
+        overall[key] = list(values)
+
+    for subject, metrics in per_subject.items():
+        for key in list(metrics.keys()):
+            if key not in overall:
+                overall[key] = []
 
     return BatchEvalResults(
         per_yaw=per_yaw,
@@ -436,13 +495,14 @@ def save_eval_checkpoint(
     checkpoint: str,
     test_subjects: list[Any],
     eval_config: dict[str, Any],
+    state_version: int = _EVAL_STATE_VERSION,
 ) -> Path:
     """Write rolling ``eval_state.json`` after each completed subject."""
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     state_path = checkpoint_dir / _EVAL_STATE_FILENAME
     payload = {
-        "version": _EVAL_STATE_VERSION,
+        "version": state_version,
         "checkpoint": checkpoint,
         "eval_config": _normalize_eval_config(eval_config),
         "test_subjects": [str(subject) for subject in test_subjects],
@@ -564,6 +624,13 @@ def _build_eval_json_payload(
     if results.metadata:
         payload["gt_reference"] = dict(results.metadata)
 
+    if any(results.overall.get(key) for key in _POINTCLOUD_METRIC_KEYS):
+        payload["pointcloud"] = _aggregate_track(
+            results,
+            _POINTCLOUD_METRIC_KEYS,
+            aggregation="one fused.ply pair per subject",
+        )
+
     return payload
 
 
@@ -597,6 +664,7 @@ def save_batch_eval_logs(
     eval_config: dict[str, Any] | None = None,
     timestamp: str | None = None,
     include_timestamp_in_filename: bool = True,
+    eval_kind: str = "image",
 ) -> dict[str, Path]:
     """
     Persist eval results for one run.
@@ -670,6 +738,7 @@ def save_batch_eval_logs(
     csv_row = {
         "timestamp": timestamp,
         "checkpoint": checkpoint,
+        "eval_kind": eval_kind,
         "num_subjects": len(test_subjects),
         "recon_n": recon_n,
         "psnr": _mean_or_none(results.overall.get("psnr", [])),
@@ -682,6 +751,11 @@ def save_batch_eval_logs(
         "gt_mv_warp_error": _mean_or_none(results.overall.get("gt_mv_warp_error", [])),
         "pose_yaw_error": _mean_or_none(results.overall.get("pose_yaw_error", [])),
         "pose_pitch_leak": _mean_or_none(results.overall.get("pose_pitch_leak", [])),
+        "chamfer_l2": _mean_or_none(results.overall.get("chamfer_l2", [])),
+        "pointcloud_f1": _mean_or_none(results.overall.get("pointcloud_f1", [])),
+        "gt_colmap_root": eval_config.get("gt_colmap_root", ""),
+        "pred_colmap_root": eval_config.get("pred_colmap_root", ""),
+        "colmap_workspace": eval_config.get("colmap_workspace", ""),
         "src_view_idx": eval_config.get("src_view_idx", ""),
         "recon_view_indices": recon_view_indices_str,
         "identity_num_yaws": eval_config.get("identity_num_yaws", ""),
@@ -768,9 +842,260 @@ def _record_metrics(
     metrics: dict[str, float],
 ) -> None:
     for key, value in metrics.items():
+        if key not in results.per_yaw:
+            results.per_yaw[key] = defaultdict(list)
+        if key not in results.per_subject[subject]:
+            results.per_subject[subject][key] = []
+        if key not in results.overall:
+            results.overall[key] = []
         results.per_yaw[key][yaw_key].append(value)
         results.per_subject[subject][key].append(value)
         results.overall[key].append(value)
+
+
+def _record_subject_metrics(
+    results: BatchEvalResults,
+    subject: str,
+    metrics: dict[str, float],
+) -> None:
+    """Append subject-level metrics (no per-yaw bucket)."""
+    subject = str(subject)
+    for key, value in metrics.items():
+        if key == "f1_threshold":
+            continue
+        if key not in results.per_subject[subject]:
+            results.per_subject[subject][key] = []
+        if key not in results.overall:
+            results.overall[key] = []
+        results.per_subject[subject][key].append(value)
+        results.overall[key].append(value)
+
+
+def _build_pointcloud_eval_config(
+    *,
+    gt_colmap_root: str | Path,
+    pred_colmap_root: str | Path,
+    colmap_workspace: str,
+    max_points: int,
+    f1_threshold: float | None,
+    f1_threshold_rel: float,
+    seed: int,
+    metrics_config: dict[str, bool],
+) -> dict[str, Any]:
+    return _normalize_eval_config(
+        {
+            "eval_kind": "pointcloud",
+            "gt_colmap_root": str(gt_colmap_root),
+            "pred_colmap_root": str(pred_colmap_root),
+            "colmap_workspace": colmap_workspace,
+            "max_points": max_points,
+            "f1_threshold": f1_threshold,
+            "f1_threshold_rel": f1_threshold_rel,
+            "seed": seed,
+            "metrics_config": dict(metrics_config),
+        }
+    )
+
+
+def _pointcloud_metrics_enabled(metrics_config: dict[str, bool]) -> bool:
+    return metrics_config.get("chamfer", True) or metrics_config.get(
+        "pointcloud_f1", True
+    )
+
+
+def run_pointcloud_eval(
+    gt_colmap_root: str | Path,
+    pred_colmap_root: str | Path,
+    test_subjects: list[Any],
+    *,
+    colmap_workspace: str = "colmap_256",
+    metrics_config: dict[str, bool] | None = None,
+    max_points: int = 100_000,
+    f1_threshold: float | None = None,
+    f1_threshold_rel: float = 0.01,
+    seed: int = 0,
+    device: str | torch.device | None = None,
+    verbose: bool = True,
+    checkpoint_dir: str | Path | None = None,
+    resume: bool = False,
+    checkpoint: str | None = None,
+    log_dir: str | Path | None = None,
+) -> BatchEvalResults:
+    """
+    Compare COLMAP ``dense/fused.ply`` per subject (pred vs GT roots).
+
+    Does not run TOSS generation; expects PLY files already on disk.
+    """
+    metrics_config = metrics_config or {"chamfer": True, "pointcloud_f1": True}
+    if not _pointcloud_metrics_enabled(metrics_config):
+        raise ValueError("At least one of chamfer / pointcloud_f1 must be enabled")
+
+    run_chamfer = metrics_config.get("chamfer", True)
+    run_f1 = metrics_config.get("pointcloud_f1", True)
+
+    run_eval_config = _build_pointcloud_eval_config(
+        gt_colmap_root=gt_colmap_root,
+        pred_colmap_root=pred_colmap_root,
+        colmap_workspace=colmap_workspace,
+        max_points=max_points,
+        f1_threshold=f1_threshold,
+        f1_threshold_rel=f1_threshold_rel,
+        seed=seed,
+        metrics_config=metrics_config,
+    )
+
+    if checkpoint_dir is not None and not checkpoint:
+        raise ValueError("checkpoint_dir requires checkpoint name for metadata/logs")
+
+    subject_ids = [str(subject) for subject in test_subjects]
+    completed_subjects: list[str] = []
+    completed_set: set[str] = set()
+    results = _init_batch_eval_results(test_subjects)
+
+    if checkpoint_dir is not None:
+        state = load_eval_checkpoint(checkpoint_dir) if resume else None
+        if state is not None:
+            if state.get("version") != _POINTCLOUD_EVAL_STATE_VERSION:
+                raise ValueError(
+                    f"unsupported pointcloud eval checkpoint version: "
+                    f"{state.get('version')}"
+                )
+            if state.get("test_subjects") != subject_ids:
+                raise ValueError(
+                    "checkpoint test_subjects mismatch; use a fresh checkpoint_dir "
+                    "or pass the same test_subjects list"
+                )
+            if not _eval_configs_match(
+                state.get("eval_config", {}),
+                run_eval_config,
+            ):
+                raise ValueError(
+                    "checkpoint eval_config mismatch; use a fresh checkpoint_dir "
+                    "or pass the same eval settings"
+                )
+            results = _results_from_serializable(state["results"])
+            completed_subjects = [str(s) for s in state.get("completed_subjects", [])]
+            completed_set = set(completed_subjects)
+            _ensure_subject_buckets(results, test_subjects)
+            if verbose:
+                print(
+                    f"Resumed pointcloud checkpoint: {len(completed_subjects)}/"
+                    f"{len(subject_ids)} subjects complete"
+                )
+        elif resume and verbose:
+            print("No pointcloud checkpoint found; starting fresh eval")
+
+    resolved_tau: float | None = None
+
+    for subject in subject_ids:
+        if subject in completed_set:
+            if verbose:
+                print(f"subject {subject}: skip (checkpoint)")
+            continue
+
+        pred_ply = resolve_fused_ply(pred_colmap_root, subject, colmap_workspace)
+        gt_ply = resolve_fused_ply(gt_colmap_root, subject, colmap_workspace)
+
+        if not pred_ply.is_file():
+            if verbose:
+                print(f"subject {subject}: skip (missing pred PLY {pred_ply})")
+            continue
+        if not gt_ply.is_file():
+            if verbose:
+                print(f"subject {subject}: skip (missing GT PLY {gt_ply})")
+            continue
+
+        try:
+            raw = compare_fused_ply_files(
+                pred_ply,
+                gt_ply,
+                compute_chamfer=run_chamfer,
+                compute_f1=run_f1,
+                max_points=max_points,
+                f1_threshold=f1_threshold,
+                f1_threshold_rel=f1_threshold_rel,
+                seed=seed,
+                device=device,
+            )
+        except Exception as exc:
+            if verbose:
+                print(f"subject {subject}: error {exc!r}")
+            continue
+
+        if "f1_threshold" in raw:
+            resolved_tau = float(raw["f1_threshold"])
+            results.metadata["f1_threshold"] = resolved_tau
+
+        record: dict[str, float] = {}
+        if run_chamfer:
+            for key in (
+                "chamfer_l2",
+                "chamfer_l2_pred_to_gt",
+                "chamfer_l2_gt_to_pred",
+            ):
+                if key in raw:
+                    record[key] = raw[key]
+        if run_f1:
+            for key in (
+                "pointcloud_f1",
+                "pointcloud_precision",
+                "pointcloud_recall",
+            ):
+                if key in raw:
+                    record[key] = raw[key]
+
+        _record_subject_metrics(results, subject, record)
+
+        if verbose:
+            msg = f"subject {subject} [pointcloud]"
+            if "chamfer_l2" in record:
+                msg += f" | chamfer_l2={record['chamfer_l2']:.6f}"
+            if "pointcloud_f1" in record:
+                msg += f" | F1={record['pointcloud_f1']:.4f}"
+            print(msg)
+
+        completed_subjects.append(subject)
+        completed_set.add(subject)
+        if checkpoint_dir is not None:
+            assert checkpoint is not None
+            save_eval_checkpoint(
+                checkpoint_dir,
+                results=results,
+                completed_subjects=completed_subjects,
+                checkpoint=checkpoint,
+                test_subjects=test_subjects,
+                eval_config=run_eval_config,
+                state_version=_POINTCLOUD_EVAL_STATE_VERSION,
+            )
+            if verbose:
+                print(
+                    f"subject {subject}: checkpoint saved "
+                    f"({len(completed_subjects)}/{len(subject_ids)})"
+                )
+
+    if verbose:
+        print_batch_eval_summary(results, test_subjects)
+
+    if (
+        checkpoint_dir is not None
+        and checkpoint is not None
+        and completed_subjects
+        and any(results.overall.get(key) for key in _POINTCLOUD_METRIC_KEYS)
+    ):
+        log_paths = save_batch_eval_logs(
+            results,
+            log_dir or checkpoint_dir,
+            checkpoint=checkpoint,
+            test_subjects=test_subjects,
+            eval_config=run_eval_config,
+            eval_kind="pointcloud",
+        )
+        if verbose:
+            print("\n=== Pointcloud eval logs saved ===")
+            for key, path in log_paths.items():
+                print(f"{key}: {path}")
+
+    return results
 
 
 def run_batch_eval(

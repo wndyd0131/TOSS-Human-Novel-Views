@@ -253,3 +253,20 @@ def compute_metrics(
 ) -> dict[str, float]:
     """Module-level shortcut for :meth:`ImageMetricsEvaluator.compute_metrics`."""
     return evaluator.compute_metrics(pred, target, fg_mask=fg_mask, **metric_flags)
+
+
+from utils.pointcloud_metrics import (  # noqa: E402
+    compare_fused_ply_files,
+    compute_chamfer_distance,
+    compute_pointcloud_f1,
+    load_ply_vertices,
+    resolve_fused_ply,
+)
+
+__all_pointcloud__ = (
+    "compare_fused_ply_files",
+    "compute_chamfer_distance",
+    "compute_pointcloud_f1",
+    "load_ply_vertices",
+    "resolve_fused_ply",
+)

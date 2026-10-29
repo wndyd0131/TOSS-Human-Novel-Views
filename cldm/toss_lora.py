@@ -6,17 +6,15 @@ from ldm.models.diffusion.ddim import DDIMSampler
 from peft import get_peft_model, LoraConfig
 import torch.nn.functional as F
 from torch import nn
-import wandb
 import lpips
-import pytz
-from datetime import datetime
 from contextlib import nullcontext
 
 import einops
 import numpy as np
-from PIL import Image
 
 from cldm.arcface_torch_wrapper import create_frozen_arcface_backbone, preprocess_arcface_input
+from cldm.toss_lora_wandb import WandbSession, append_grad_diagnostics
+from cldm.toss_lora_vis import TossLoraTrainingVis, maybe_log_training_vis
 # CRITICAL FIX: Completely disable gradient checkpointing to fix LoRA gradient flow
 # The custom CheckpointFunction doesn't properly handle PEFT's dynamically added parameters
 import ldm.modules.diffusionmodules.util as ldm_util
@@ -27,8 +25,6 @@ def _no_checkpoint(func, inputs, params, flag):
 ldm_util.checkpoint = _no_checkpoint
 print("[PATCH] Disabled gradient checkpointing in ldm_util.checkpoint")
 
-run = None
-
 def _cosine_similarity_loss(pred_normals, gt_normals, mask, eps=1e-8):
     """Masked cosine similarity loss. pred, gt: [B,3,H,W] L2-normalized. mask: [B,1,H,W]."""
     cos_sim = (pred_normals * gt_normals).sum(dim=1, keepdim=True).clamp(-1, 1)
@@ -38,12 +34,6 @@ def _cosine_similarity_loss(pred_normals, gt_normals, mask, eps=1e-8):
         return loss.sum() / (mask.sum() + eps)
     return loss.mean()
 
-def _normal_to_rgb_vis(norm):
-    """Map unit normal field to RGB in [0,1] for visualization. norm: [B,3,H,W] or [3,H,W]. Returns [3,H,W]."""
-    if norm.dim() == 4:
-        norm = norm[0]
-    return torch.clamp((norm + 1) / 2, 0, 1)
-
 def _grayscale_sobel_3ch(rgb_01):
     """rgb_01: [B, 3, H, W] in [0, 1]. Returns 3-channel Sobel magnitude in [0, 1]."""
     from kornia.color import rgb_to_grayscale
@@ -51,17 +41,6 @@ def _grayscale_sobel_3ch(rgb_01):
     gray = rgb_to_grayscale(rgb_01)         # [B, 1, H, W]
     edge = sobel(gray)                      # [B, 1, H, W] L2 gradient magnitude
     return edge.expand(-1, 3, -1, -1).clamp(0.0, 1.0)
-
-def _grad_norm_l2(loss, params):
-    """L2 norm of gradients of ``loss`` w.r.t. ``params`` without modifying ``.grad``."""
-    grads = torch.autograd.grad(
-        loss, params,
-        retain_graph=True,
-        allow_unused=True,
-        create_graph=False,
-    )
-    sq = sum(g.detach().pow(2).sum() for g in grads if g is not None)
-    return sq.sqrt()
 
 def _grad_probe(loss, named_tensors):
     """Per-tensor grad norms of ``loss``.
@@ -177,37 +156,7 @@ class TossLoraModule(TOSS):
         self._vis_subject_ids = None
         self._vis_gt_bundles = None
 
-        global run
-        kst = pytz.timezone("Asia/Seoul")
-        now_kst = datetime.now(kst).strftime("%Y%m%d_%H%M%S")
-        run = wandb.init(
-            entity="wndyd0131-sungkyunkwan-university",
-            project="toss-lora",
-            name=f"toss-lora_{now_kst}",
-            config={
-                # LoRA config
-                "lora_r": lora_config_params.get("r", 16),
-                "lora_alpha": lora_config_params.get("lora_alpha", 16),
-                "lora_dropout": lora_config_params.get("lora_dropout", 0.0),
-                "target_modules": lora_config_params.get("target_modules", []),
-                # Model config
-                "architecture": "TOSS + LoRA",
-                "base_model": "Stable Diffusion UNet",
-                # Identity loss (ArcFace)
-                "identity_loss_weight": self.identity_loss_weight,
-                "identity_t_cut": self.identity_t_cut,
-                "arcface_ckpt_path": self.arcface_ckpt_path,
-                "arcface_spatial_mode": self.arcface_spatial_mode,
-                # DISTS perceptual loss (image + Sobel)
-                "dists_loss_weight": self.dists_loss_weight,
-                "dists_t_cut": self.dists_t_cut,
-                # Correlation feature regularization
-                "lambda_corr": self.lambda_corr,
-                "corr_embed_dim": self.corr_embed_dim,
-                "corr_proj_trainable": self.corr_proj_trainable,
-                "corr_flow_src_size": self.corr_flow_src_size,
-            },
-        )
+        self._wandb = WandbSession.start(self, lora_config_params)
 
         unet = self.model.diffusion_model
         def disable_all_ckpt(m):
@@ -287,6 +236,8 @@ class TossLoraModule(TOSS):
         unet.output_blocks[-1].register_forward_hook(_corr_hook)
         print(f"[INIT] Registered corr feature hook on output_blocks[-1]")
 
+        self._training_vis = TossLoraTrainingVis(self)
+
     def _decode_first_stage_train(self, z):
         """Like ``decode_first_stage`` but without grad-disabled decorator so x0 gradients reach RGB."""
         z = (1.0 / self.scale_factor) * z
@@ -341,13 +292,6 @@ class TossLoraModule(TOSS):
             self._sampler = DDIMSampler(self)
         return self._sampler
 
-    @staticmethod
-    def _hint_tensor_to_pil(hint_tensor):
-        """Convert batch hint ``[C,H,W]`` in [0,1] to PIL RGB for inference."""
-        arr = hint_tensor.detach().cpu().permute(1, 2, 0).numpy()
-        arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
-        return Image.fromarray(arr, mode="RGB")
-
     def on_save_checkpoint(self, checkpoint):
         # We override this to prevent the parent class from 
         # trying to call self.embedding_manager.save()
@@ -357,222 +301,15 @@ class TossLoraModule(TOSS):
         # checkpoint["state_dict"] = {k: v for k, v in checkpoint["state_dict"].items() if "lora" in k or "pose_net" in k}
         pass
 
-    def _load_vis_source_from_paths(self):
-        """Load fixed RGBA + mask paths (same preprocessing as batch_eval / Colab)."""
-        from utils.image import preprocess_image
-
-        if not self.vis_source_image:
-            return
-        img = Image.open(self.vis_source_image).convert("RGBA")
-        mask = None
-        if self.vis_source_mask:
-            mask = Image.open(self.vis_source_mask).convert("L")
-        arr = preprocess_image(img, fg_mask=mask, size=self.vis_image_size)
-        pil = Image.fromarray(np.clip(arr * 255.0, 0, 255).astype(np.uint8))
-        name = str(self.vis_source_image)
-        self._vis_source_pils = [pil]
-        self._vis_names = [name]
-        hint = torch.from_numpy(arr).permute(2, 0, 1).float()
-        self._vis_sources = hint.unsqueeze(0)
-        print(f"[VIS] Fixed source from disk: {name}")
-
-    @staticmethod
-    def _load_poses_npy(subject_dir: str):
-        poses_path = os.path.join(subject_dir, "poses.npy")
-        if not os.path.isfile(poses_path):
-            return None
-        poses = np.load(poses_path)
-        if poses.ndim == 2 and poses.shape[1] == 16:
-            poses = poses.reshape(-1, 4, 4)
-        return poses
-
-    def _gt_items_for_subject_dir(self, subject_dir: str):
-        """Return list of (view_idx, delta, gt_pil, gt_mask) for one subject folder."""
-        from utils.image import preprocess_image
-        from utils.pose import compute_relative_pose
-
-        poses = self._load_poses_npy(subject_dir)
-        if poses is None:
-            print(f"[VIS][WARN] Missing poses.npy under {subject_dir}; skip GT for this subject.")
-            return []
-
-        src_idx = self.vis_src_view_idx
-        if src_idx < 0 or src_idx >= len(poses):
-            print(
-                f"[VIS][WARN] vis_src_view_idx={src_idx} out of range for {subject_dir} "
-                f"(num_views={len(poses)})."
-            )
-            return []
-
-        items = []
-        for view_idx in self.vis_gt_view_indices:
-            view_idx = int(view_idx)
-            img_path = os.path.join(subject_dir, f"{view_idx:05d}.png")
-            mask_path = os.path.join(subject_dir, "alpha_maps", f"{view_idx:05d}.png")
-            if not os.path.isfile(img_path) or not os.path.isfile(mask_path):
-                print(
-                    f"[VIS][WARN] Missing GT view {view_idx:05d} under {subject_dir}; skip that view."
-                )
-                continue
-            if view_idx < 0 or view_idx >= len(poses):
-                print(f"[VIS][WARN] view_idx={view_idx} out of range for {subject_dir}; skip.")
-                continue
-
-            delta = compute_relative_pose(poses[src_idx], poses[view_idx]).astype(np.float32)
-            gt_img = Image.open(img_path).convert("RGBA")
-            gt_mask = Image.open(mask_path).convert("L")
-            gt_arr = preprocess_image(gt_img, fg_mask=gt_mask, size=self.vis_image_size)
-            gt_pil = Image.fromarray(np.clip(gt_arr * 255.0, 0, 255).astype(np.uint8))
-            items.append((view_idx, delta, gt_pil, gt_mask))
-        return items
-
-    def _subject_dir_for_id(self, subject_id: str) -> str:
-        root = os.path.abspath(self.vis_data_root)
-        return os.path.join(root, str(subject_id))
-
-    def _subject_dir_for_vis_name(self, name: str) -> str | None:
-        """Subject folder containing ``poses.npy`` for multiview vis (matches GT recon)."""
-        if self.vis_data_root:
-            candidate = self._subject_dir_for_id(name)
-            if os.path.isdir(candidate) and os.path.isfile(
-                os.path.join(candidate, "poses.npy")
-            ):
-                return candidate
-            if os.path.isfile(name):
-                subject_dir = os.path.dirname(os.path.abspath(name))
-                if os.path.isfile(os.path.join(subject_dir, "poses.npy")):
-                    return subject_dir
-            basename = os.path.basename(str(name).rstrip(os.sep))
-            candidate = self._subject_dir_for_id(basename)
-            if os.path.isdir(candidate) and os.path.isfile(
-                os.path.join(candidate, "poses.npy")
-            ):
-                return candidate
-        if self.vis_source_image:
-            subject_dir = os.path.dirname(os.path.abspath(self.vis_source_image))
-            if os.path.isfile(os.path.join(subject_dir, "poses.npy")):
-                return subject_dir
-        return None
-
-    def _vis_gt_subject_id_list(self):
-        if self.vis_subject_ids:
-            return list(self.vis_subject_ids)
-        if self._vis_subject_ids:
-            return list(self._vis_subject_ids)
-        if self.vis_data_root and self._vis_names:
-            return [str(n) for n in self._vis_names]
-        return []
-
-    def _build_vis_gt_bundles(self):
-        """One bundle per subject: {subject_name, items}. Same subjects as yaw vis when possible."""
-        if not self.vis_gt_enabled or not self.vis_gt_view_indices:
-            return []
-
-        bundles = []
-        for subject_id in self._vis_gt_subject_id_list():
-            subject_dir = self._subject_dir_for_id(subject_id)
-            if not os.path.isdir(subject_dir):
-                print(f"[VIS][WARN] Subject dir not found: {subject_dir}; skip GT.")
-                continue
-            items = self._gt_items_for_subject_dir(subject_dir)
-            if items:
-                view_ids = [v for v, _, _, _ in items]
-                print(
-                    f"[VIS] GT recon subject {subject_id} (src view {self.vis_src_view_idx}): "
-                    f"targets {view_ids}"
-                )
-                bundles.append({"subject_name": str(subject_id), "items": items})
-
-        if bundles:
-            return bundles
-
-        if self.vis_source_image:
-            subject_dir = os.path.dirname(os.path.abspath(self.vis_source_image))
-            items = self._gt_items_for_subject_dir(subject_dir)
-            if items:
-                name = os.path.basename(subject_dir.rstrip(os.sep))
-                view_ids = [v for v, _, _, _ in items]
-                print(
-                    f"[VIS] GT recon from vis_source_image subject {name} "
-                    f"(src view {self.vis_src_view_idx}): targets {view_ids}"
-                )
-                return [{"subject_name": name, "items": items}]
-
-        if not self._vis_gt_subject_id_list() and not self.vis_source_image:
-            print(
-                "[VIS][WARN] GT recon needs vis_data_root + vis_subject_ids (or set_vis_sources "
-                "subject_ids / names), or vis_source_image."
-            )
-        return []
-
-    def _ensure_vis_gt_bundles(self):
-        if self._vis_gt_bundles is None:
-            self._vis_gt_bundles = self._build_vis_gt_bundles()
-        elif not self._vis_gt_bundles and self._vis_gt_subject_id_list():
-            self._vis_gt_bundles = self._build_vis_gt_bundles()
-        return self._vis_gt_bundles
-
-    def _load_vis_sources_from_dataset_root(self):
-        """Load fixed yaw sources from ``vis_data_root`` / ``vis_subject_ids`` (same as GT subjects)."""
-        from utils.image import preprocess_image
-
-        if not self.vis_data_root or not self.vis_subject_ids:
-            return
-        if self._vis_source_pils is not None:
-            return
-
-        hints = []
-        names = []
-        src_idx = self.vis_src_view_idx
-        for subject_id in self.vis_subject_ids:
-            subject_dir = self._subject_dir_for_id(subject_id)
-            img_path = os.path.join(subject_dir, f"{src_idx:05d}.png")
-            mask_path = os.path.join(subject_dir, "alpha_maps", f"{src_idx:05d}.png")
-            if not os.path.isfile(img_path):
-                print(f"[VIS][WARN] Missing source {img_path}; skip vis subject {subject_id}.")
-                continue
-            mask = Image.open(mask_path).convert("L") if os.path.isfile(mask_path) else None
-            img = Image.open(img_path).convert("RGBA")
-            arr = preprocess_image(img, fg_mask=mask, size=self.vis_image_size)
-            hints.append(torch.from_numpy(arr).permute(2, 0, 1).float())
-            names.append(str(subject_id))
-
-        if not hints:
-            print("[VIS][WARN] No vis sources loaded from vis_data_root / vis_subject_ids.")
-            return
-
-        self.set_vis_sources(torch.stack(hints, dim=0), names=names, subject_ids=names)
-        print(f"[VIS] Loaded {len(names)} yaw/GT source(s) from {self.vis_data_root}")
+    def set_vis_sources(self, images, names=None, subject_ids=None):
+        """Fix the source faces used for training-time multiview visualization."""
+        return self._training_vis.set_vis_sources(images, names=names, subject_ids=subject_ids)
 
     def on_train_start(self):
         """Called by PyTorch Lightning when training starts - log trainer config"""
         self._trainable_params = [p for p in self.parameters() if p.requires_grad]
-        self._load_vis_source_from_paths()
-        self._load_vis_sources_from_dataset_root()
-        self._ensure_vis_gt_bundles()
-        if run is not None and self.trainer is not None:
-            run.config.update({
-                "max_epochs": self.trainer.max_epochs,
-                "max_steps": self.trainer.max_steps,
-                "batch_size": self.trainer.datamodule.batch_size if hasattr(self.trainer, 'datamodule') and self.trainer.datamodule else None,
-                "accumulate_grad_batches": self.trainer.accumulate_grad_batches,
-                "gradient_clip_val": self.trainer.gradient_clip_val,
-                "learning_rate": self.learning_rate,
-                # Training config from kwargs if available
-                "image_size": self.image_size,
-                "timesteps": self.num_timesteps,
-                # Loss config
-                "loss_type": "mse",
-                "mse_weight": self.mse_weight,
-                "identity_loss_weight": self.identity_loss_weight,
-                "identity_t_cut": self.identity_t_cut,
-                "dists_loss_weight": self.dists_loss_weight,
-                "dists_t_cut": self.dists_t_cut,
-                "lambda_corr": self.lambda_corr,
-                "corr_embed_dim": self.corr_embed_dim,
-                "corr_proj_trainable": self.corr_proj_trainable,
-                "corr_flow_src_size": self.corr_flow_src_size,
-            }, allow_val_change=True)
+        self._training_vis.prepare()
+        self._wandb.update_trainer(self, self.trainer)
 
     @staticmethod
     def _as_bchw(t):
@@ -746,243 +483,8 @@ class TossLoraModule(TOSS):
 
         return loss_corr, log
 
-    def set_vis_sources(self, images, names=None, subject_ids=None):
-        """Fix the source faces used for training-time multiview visualization.
 
-        images: [N, 3, H, W] (or [N, H, W, 3]) in [0, 1], same layout as the dataset's "hint".
-        subject_ids: optional folder names under ``vis_data_root`` for GT recon (defaults to ``names``).
-        """
-        if images.ndim == 4 and images.shape[-1] == 3:
-            images = einops.rearrange(images, "b h w c -> b c h w")
-        self._vis_sources = images.detach().float().cpu().clone()
-        self._vis_names = list(names) if names is not None else [str(i) for i in range(images.shape[0])]
-        if subject_ids is not None:
-            self._vis_subject_ids = [str(s) for s in subject_ids]
-        elif self.vis_data_root:
-            self._vis_subject_ids = list(self._vis_names)
-        else:
-            self._vis_subject_ids = None
-        self._vis_source_pils = [
-            self._hint_tensor_to_pil(self._vis_sources[i]) for i in range(self._vis_sources.shape[0])
-        ]
-        self._vis_gt_bundles = None
-        print(f"[VIS] Fixed {len(self._vis_names)} visualization source(s): {self._vis_names}")
 
-    def _log_multiview_vis(self, batch, wandb_log):
-        """Sample fixed sources via ``utils.inference.generate_batch`` (Colab / eval path)."""
-        from utils.inference import generate_batch
-        from utils.pose import delta_pose_for_yaw_degrees
-
-        if self._vis_sources is None and self._vis_source_pils is None:
-            src = batch[self.control_key][:1]
-            self.set_vis_sources(
-                src,
-                names=[str(batch["subject_id"][0])] if "subject_id" in batch else None,
-            )
-            print("[VIS][WARN] vis_source_image / set_vis_sources not set; using first training batch hint.")
-
-        step = int(self.global_step)
-        source_pils = self._vis_source_pils
-        if source_pils is None:
-            source_pils = [self._hint_tensor_to_pil(t) for t in self._vis_sources]
-
-        unet = self.model.diffusion_model
-        was_training = unet.training
-        unet.eval()
-        normal_gt_and_preds = []
-        try:
-            with torch.no_grad():
-                wandb_images = []
-                for src_pil, name in zip(source_pils, self._vis_names):
-                    src_show = np.asarray(src_pil.convert("RGB"), dtype=np.float32) / 255.0
-                    src_show = torch.from_numpy(src_show).permute(2, 0, 1)
-                    wandb_images.append(wandb.Image(
-                        src_show,
-                        caption=f"Step {step} | {name} | SOURCE",
-                    ))
-
-                    subject_dir = self._subject_dir_for_vis_name(name)
-                    if subject_dir is None:
-                        print(
-                            "[VIS][WARN] No poses.npy for multiview vis "
-                            f"(name={name}); set vis_data_root or vis_source_image. Skip preds."
-                        )
-                        continue
-                    poses = self._load_poses_npy(subject_dir)
-                    if poses is None:
-                        print(
-                            f"[VIS][WARN] Missing poses.npy under {subject_dir}; skip preds."
-                        )
-                        continue
-                    src_idx = self.vis_src_view_idx
-                    if src_idx < 0 or src_idx >= len(poses):
-                        print(
-                            f"[VIS][WARN] vis_src_view_idx={src_idx} out of range "
-                            f"(num_views={len(poses)}); skip preds."
-                        )
-                        continue
-                    src_pose = poses[src_idx]
-                    delta_pose_list = [
-                        delta_pose_for_yaw_degrees(src_pose, yaw_deg)
-                        for yaw_deg in self.vis_yaws_deg
-                    ]
-                    preds = generate_batch(
-                        self,
-                        src_pil,
-                        prompt="",
-                        delta_pose_list=delta_pose_list,
-                        h=self.vis_image_size,
-                        w=self.vis_image_size,
-                        ddim_steps=self.vis_ddim_steps,
-                        ddim_eta=0.0,
-                        img_scale=self.vis_img_scale,
-                        prompt_scale=self.vis_prompt_scale,
-                        precision=self.vis_precision,
-                        use_ema_scope=self.vis_use_ema_scope,
-                        shared_noise=True,
-                        seed=self.vis_seed,
-                    )
-                    for yaw_deg, pred in zip(self.vis_yaws_deg, preds):
-                        pred_t = torch.from_numpy(
-                            np.asarray(pred.convert("RGB"), dtype=np.float32) / 255.0
-                        ).permute(2, 0, 1)
-                        wandb_images.append(wandb.Image(
-                            pred_t,
-                            caption=(
-                                f"Step {step} | {name} | Yaw: {yaw_deg:g}° | "
-                                f"cfg={self.vis_img_scale:g} | seed={self.vis_seed}"
-                            ),
-                        ))
-
-                if "normal" in batch and "normal_mask" in batch:
-                    gt_n = batch["normal"][:1].to(self.device)
-                    normal_gt_and_preds.append(wandb.Image(
-                        _normal_to_rgb_vis(gt_n),
-                        caption=f"Step {step} | GT normal (target view)",
-                    ))
-                    nm = batch["normal_mask"][:1].to(self.device).float()
-                    if nm.ndim == 4:
-                        nm = nm[0]
-                    m = nm[0] if nm.ndim == 3 else nm
-                    m_vis = torch.clamp(m, 0, 1).unsqueeze(0).expand(3, -1, -1)
-                    normal_gt_and_preds.append(wandb.Image(
-                        m_vis,
-                        caption=f"Step {step} | GT normal_mask",
-                    ))
-        finally:
-            unet.train(was_training)
-
-        wandb_log["multiview_predictions"] = wandb_images
-        if normal_gt_and_preds:
-            wandb_log["normal_gt_and_preds"] = normal_gt_and_preds
-        print(f"[VIS] Logged multiview (+ normals) at step {step}")
-
-    def _log_gt_recon_vis(self, wandb_log):
-        """GT-aligned reconstructions via ``generate_batch(delta_pose_list=...)``."""
-        bundles = self._ensure_vis_gt_bundles()
-        if not bundles:
-            return
-
-        from utils.eval_metrics import compute_psnr
-        from utils.image import preprocess_image, resize_mask
-        from utils.inference import generate_batch
-
-        source_pils = self._vis_source_pils
-        if source_pils is None and self._vis_sources is not None:
-            source_pils = [self._hint_tensor_to_pil(t) for t in self._vis_sources]
-        if not source_pils:
-            print("[VIS][WARN] No vis source for GT recon; skipping.")
-            return
-
-        step = int(self.global_step)
-        unet = self.model.diffusion_model
-        was_training = unet.training
-        unet.eval()
-        wandb_images = []
-        n_views = 0
-        try:
-            with torch.no_grad():
-                for bundle_idx, bundle in enumerate(bundles):
-                    subject = bundle["subject_name"]
-                    items = bundle["items"]
-                    if bundle_idx >= len(source_pils):
-                        print(
-                            f"[VIS][WARN] No yaw source for GT subject {subject} "
-                            f"(index {bundle_idx}); skip."
-                        )
-                        continue
-                    src_pil = source_pils[bundle_idx]
-                    delta_pose_list = [d for _, d, _, _ in items]
-                    preds = generate_batch(
-                        self,
-                        src_pil,
-                        prompt="",
-                        delta_pose_list=delta_pose_list,
-                        h=self.vis_image_size,
-                        w=self.vis_image_size,
-                        ddim_steps=self.vis_ddim_steps,
-                        ddim_eta=0.0,
-                        img_scale=self.vis_img_scale,
-                        prompt_scale=self.vis_prompt_scale,
-                        precision=self.vis_precision,
-                        use_ema_scope=self.vis_use_ema_scope,
-                        shared_noise=True,
-                        seed=self.vis_seed,
-                    )
-
-                    src_show = np.asarray(src_pil.convert("RGB"), dtype=np.float32) / 255.0
-                    src_show = torch.from_numpy(src_show).permute(2, 0, 1)
-                    wandb_images.append(wandb.Image(
-                        src_show,
-                        caption=(
-                            f"Step {step} | {subject} | SOURCE (view {self.vis_src_view_idx})"
-                        ),
-                    ))
-
-                    for (view_idx, delta, gt_pil, gt_mask_pil), pred in zip(items, preds):
-                        gt_t = torch.from_numpy(
-                            np.asarray(gt_pil.convert("RGB"), dtype=np.float32) / 255.0
-                        ).permute(2, 0, 1)
-                        pred_t = torch.from_numpy(
-                            np.asarray(pred.convert("RGB"), dtype=np.float32) / 255.0
-                        ).permute(2, 0, 1)
-                        pitch_deg = float(np.degrees(delta[0]))
-                        yaw_deg = float(np.degrees(delta[1]))
-                        dist = float(delta[2])
-                        pose_str = (
-                            f"Δpitch={pitch_deg:.2f}° Δyaw={yaw_deg:.2f}° Δdist={dist:.4f}"
-                        )
-                        wandb_images.append(wandb.Image(
-                            gt_t,
-                            caption=(
-                                f"Step {step} | {subject} | GT view {view_idx:05d} | {pose_str}"
-                            ),
-                        ))
-                        wandb_images.append(wandb.Image(
-                            pred_t,
-                            caption=(
-                                f"Step {step} | {subject} | PRED view {view_idx:05d} | "
-                                f"{pose_str} | cfg={self.vis_img_scale:g} | seed={self.vis_seed}"
-                            ),
-                        ))
-
-                        gt_np = np.asarray(gt_pil.convert("RGB"), dtype=np.float32) / 255.0
-                        pred_np = preprocess_image(
-                            pred.convert("RGB"),
-                            fg_mask=gt_mask_pil,
-                            size=self.vis_image_size,
-                        )
-                        mask_np = resize_mask(gt_mask_pil, size=self.vis_image_size)
-                        fg_psnr = compute_psnr(pred_np, gt_np, mask=mask_np)
-                        wandb_log[f"vis_gt/fg_psnr_{subject}_view_{view_idx}"] = fg_psnr
-                        n_views += 1
-        finally:
-            unet.train(was_training)
-
-        wandb_log["gt_recon_predictions"] = wandb_images
-        print(
-            f"[VIS] Logged GT recon ({len(bundles)} subject(s), {n_views} view(s)) at step {step}"
-        )
 
     def _compute_batch_loss(self, batch, *, decode_mode="train"):
         """Shared train/val loss: masked MSE + optional corr, identity, DISTS."""
@@ -1129,18 +631,9 @@ class TossLoraModule(TOSS):
         return loss
 
     def on_validation_epoch_end(self):
-        if run is None or self.trainer is None:
+        if self.trainer is None:
             return
-        metrics = {}
-        for key, value in self.trainer.callback_metrics.items():
-            if not str(key).startswith("val/"):
-                continue
-            if torch.is_tensor(value):
-                metrics[key] = value.detach().item()
-            else:
-                metrics[key] = value
-        if metrics:
-            run.log(metrics, step=int(self.global_step))
+        self._wandb.log_validation(self.trainer.callback_metrics, int(self.global_step))
 
     def training_step(self, batch, batch_idx):
         self.model.diffusion_model.train()
@@ -1153,76 +646,11 @@ class TossLoraModule(TOSS):
         )
 
         wandb_log = dict(log_dict)
-
-        if self.global_step % 50 == 0:
-
-            # Gradient 진단용 parameter groups
-            lora_params = [
-                p for n, p in self.model.diffusion_model.named_parameters()
-                if p.requires_grad and "lora" in n.lower()
-            ]
-
-            finetune_params = [
-                p for n, p in self.model.diffusion_model.named_parameters()
-                if p.requires_grad and (
-                    "pose_net" in n
-                    or "vae_proj" in n
-                    or "base_model.model.out." in n
-                )
-            ]
-
-            corr_proj_params = [
-                p for p in self.corr_proj.parameters()
-                if p.requires_grad
-            ]
-
-            # MSE -> LoRA gradient (uses masked MSE when enabled)
-            wandb_log["mse_grad_lora"] = _grad_norm_l2(
-                mse_for_grad, lora_params
-            )
-
-            if corr_loss is not None:
-                weighted_corr = self.lambda_corr * corr_loss
-
-                # CORR -> 각각의 parameter group gradient
-                wandb_log["corr_grad_lora"] = _grad_norm_l2(
-                    weighted_corr, lora_params
-                )
-
-                wandb_log["corr_grad_finetune"] = _grad_norm_l2(
-                    weighted_corr, finetune_params
-                )
-
-                wandb_log["corr_grad_proj"] = _grad_norm_l2(
-                    weighted_corr, corr_proj_params
-                )
-
-                # CORR이 LoRA에 주는 영향 / MSE가 LoRA에 주는 영향
-                mse_g = wandb_log["mse_grad_lora"]
-                corr_g = wandb_log["corr_grad_lora"]
-
-                wandb_log["corr_mse_grad_ratio_lora"] = (
-                    corr_g / (mse_g + 1e-12))
-
-            if dists_loss is not None:
-                weighted_dists = self.dists_loss_weight * dists_loss
-                wandb_log["dists_grad_lora"] = _grad_norm_l2(
-                    weighted_dists, lora_params
-                )
-                wandb_log["dists_grad_finetune"] = _grad_norm_l2(
-                    weighted_dists, finetune_params
-                )
-                wandb_log["dists_mse_grad_ratio_lora"] = (
-                    wandb_log["dists_grad_lora"]
-                    / (wandb_log["mse_grad_lora"] + 1e-12)
-                )
-
-        if self.vis_every_n_steps > 0 and self.global_step % self.vis_every_n_steps == 0:
-            self._log_multiview_vis(batch, wandb_log)
-            self._log_gt_recon_vis(wandb_log)
-
-        print(f"LOSS logged: total={loss.item():.4f}")
-        run.log(wandb_log, step=int(self.global_step))
+        append_grad_diagnostics(wandb_log, self, mse_for_grad, corr_loss, dists_loss)
+        maybe_log_training_vis(
+            self._training_vis, batch, wandb_log, int(self.global_step)
+        )
+        self._wandb.log_train(wandb_log, int(self.global_step), loss.item())
 
         self.log("train_loss", loss, prog_bar=True, logger=True)
         return loss
