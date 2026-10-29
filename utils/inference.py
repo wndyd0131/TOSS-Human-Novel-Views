@@ -222,7 +222,7 @@ def generate_batch(
     ddim_steps: int = 30,
     ddim_eta: float = 0.0,
     prompt_scale: float = 1.0,
-    img_scale: float = 3.0,
+    img_scale: float = 5.0,
     img_ucg: float = 0.05,
     shared_noise: bool = True,
     chunk_size: int | None = None,
