@@ -453,6 +453,7 @@ def _build_run_eval_config(
     identity_yaw_max_deg: float,
     identity_num_yaws: int,
     metrics_config: dict[str, bool],
+    gen_seed: int | None = None,
 ) -> dict[str, Any]:
     return _normalize_eval_config(
         {
@@ -462,8 +463,16 @@ def _build_run_eval_config(
             "identity_yaw_max_deg": identity_yaw_max_deg,
             "identity_num_yaws": identity_num_yaws,
             "metrics_config": dict(metrics_config),
+            "gen_seed": gen_seed,
         }
     )
+
+
+def _subject_gen_seed(gen_seed: int | None, subject: str) -> int | None:
+    """Deterministic DDIM ``x_T`` seed per subject: ``gen_seed + int(subject_id)``."""
+    if gen_seed is None:
+        return None
+    return int(gen_seed) + int(subject)
 
 
 def _init_batch_eval_results(test_subjects: list[Any]) -> BatchEvalResults:
@@ -771,6 +780,7 @@ def _generate_batch(
     *,
     delta_pose_list: list[np.ndarray],
     eval_gen_batch_size: int | None = None,
+    seed: int | None = None,
 ) -> list[Image.Image]:
     return generate_batch(
         toss,
@@ -779,6 +789,7 @@ def _generate_batch(
         delta_pose_list=delta_pose_list,
         shared_noise=True,
         chunk_size=eval_gen_batch_size,
+        seed=seed,
     )
 
 
@@ -1119,12 +1130,19 @@ def run_batch_eval(
     log_dir: str | Path | None = None,
     mv_evaluator: MultiviewMetricsEvaluator | None = None,
     pose_estimator: HeadPoseEstimator | None = None,
+    gen_seed: int | None = 42,
 ) -> BatchEvalResults:
     """
     Generate novel views per subject and evaluate with metrics_evaluator.
 
     Requires a toss-like object with ``model``, ``sampler``, and ``device``.
     Batch generation uses ``utils.inference.generate_batch``.
+
+    ``gen_seed``:
+        Base seed for reproducible DDIM initial noise. Per subject uses
+        ``gen_seed + int(subject_id)`` for both reconstruction and identity
+        tracks. Pass ``None`` to restore legacy random ``x_T`` (not recommended
+        for metric comparison across runs).
 
     Reconstruction track (PSNR / LPIPS):
         Fixed upper-ring GT view indices (``recon_view_indices``), excluding
@@ -1170,6 +1188,7 @@ def run_batch_eval(
         identity_yaw_max_deg=identity_yaw_max_deg,
         identity_num_yaws=identity_num_yaws,
         metrics_config=metrics_config,
+        gen_seed=gen_seed,
     )
     if eval_config is not None:
         run_eval_config.update(_normalize_eval_config(eval_config))
@@ -1227,6 +1246,7 @@ def run_batch_eval(
             continue
 
         sub_path = os.path.join(test_root, subject)
+        subject_seed = _subject_gen_seed(gen_seed, subject)
 
         poses = np.load(os.path.join(sub_path, "poses.npy")).reshape(-1, 4, 4)
         recon_views = select_recon_views(
@@ -1267,6 +1287,7 @@ def run_batch_eval(
                     src_input,
                     delta_pose_list=delta_pose_list,
                     eval_gen_batch_size=eval_gen_batch_size,
+                    seed=subject_seed,
                 )
 
                 for gen_pil, (view_idx, yaw_key, _) in zip(recon_pils, recon_meta):
@@ -1318,6 +1339,7 @@ def run_batch_eval(
                 src_input,
                 delta_pose_list=delta_pose_list,
                 eval_gen_batch_size=eval_gen_batch_size,
+                seed=subject_seed,
             )
 
             if run_mv and mv_evaluator is not None:
