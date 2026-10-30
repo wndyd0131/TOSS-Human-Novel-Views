@@ -1,38 +1,28 @@
-import math
-import os
 import torch
 from cldm.toss import TOSS
-from ldm.models.diffusion.ddim import DDIMSampler
 from peft import get_peft_model, LoraConfig
 import torch.nn.functional as F
 from torch import nn
-import lpips
 from contextlib import nullcontext
 
 import einops
-import numpy as np
 
 from cldm.arcface_torch_wrapper import create_frozen_arcface_backbone, preprocess_arcface_input
 from cldm.toss_lora_wandb import WandbSession, append_grad_diagnostics
-from cldm.toss_lora_vis import TossLoraTrainingVis, maybe_log_training_vis
+from cldm.toss_lora_vis import (
+    TossLoraTrainingVis,
+    install_training_vis_config,
+    maybe_log_training_vis,
+)
 # CRITICAL FIX: Completely disable gradient checkpointing to fix LoRA gradient flow
 # The custom CheckpointFunction doesn't properly handle PEFT's dynamically added parameters
 import ldm.modules.diffusionmodules.util as ldm_util
-_original_checkpoint = ldm_util.checkpoint
+
 def _no_checkpoint(func, inputs, params, flag):
     """Always bypass checkpointing - just run the function directly"""
     return func(*inputs)
 ldm_util.checkpoint = _no_checkpoint
 print("[PATCH] Disabled gradient checkpointing in ldm_util.checkpoint")
-
-def _cosine_similarity_loss(pred_normals, gt_normals, mask, eps=1e-8):
-    """Masked cosine similarity loss. pred, gt: [B,3,H,W] L2-normalized. mask: [B,1,H,W]."""
-    cos_sim = (pred_normals * gt_normals).sum(dim=1, keepdim=True).clamp(-1, 1)
-    loss = 1 - cos_sim  # [B,1,H,W]
-    if mask is not None:
-        loss = loss * mask
-        return loss.sum() / (mask.sum() + eps)
-    return loss.mean()
 
 def _grayscale_sobel_3ch(rgb_01):
     """rgb_01: [B, 3, H, W] in [0, 1]. Returns 3-channel Sobel magnitude in [0, 1]."""
@@ -41,25 +31,6 @@ def _grayscale_sobel_3ch(rgb_01):
     gray = rgb_to_grayscale(rgb_01)         # [B, 1, H, W]
     edge = sobel(gray)                      # [B, 1, H, W] L2 gradient magnitude
     return edge.expand(-1, 3, -1, -1).clamp(0.0, 1.0)
-
-def _grad_probe(loss, named_tensors):
-    """Per-tensor grad norms of ``loss``.
-
-    Keeps three outcomes distinct that a plain norm collapses into ``0``:
-    ``no_requires_grad`` (never tracked), ``None`` (tracked but unreached), and an exact ``0.0000e+00``.
-    """
-    live = [(n, t) for n, t in named_tensors if t.requires_grad]
-    result = {n: "no_requires_grad" for n, t in named_tensors if not t.requires_grad}
-    if live:
-        grads = torch.autograd.grad(
-            loss, [t for _, t in live],
-            retain_graph=True,
-            allow_unused=True,
-            create_graph=False,
-        )
-        for (n, _), g in zip(live, grads):
-            result[n] = "None" if g is None else f"{g.detach().norm().item():.4e}"
-    return " ".join(f"{n}={result[n]}" for n, _ in named_tensors)
 
 class TossLoraModule(TOSS):
     def __init__(
@@ -79,22 +50,7 @@ class TossLoraModule(TOSS):
         corr_proj_trainable=True,
         corr_debug_steps=200,
         corr_flow_src_size=32,
-        vis_every_n_steps=50,
-        vis_yaws_deg=(-15, -5, 5, 15),
-        vis_ddim_steps=30,
-        vis_img_scale=3.0,
-        vis_prompt_scale=1.0,
-        vis_seed=40,
-        vis_image_size=256,
-        vis_precision="autocast",
-        vis_use_ema_scope=False,
-        vis_source_image=None,
-        vis_source_mask=None,
-        vis_data_root=None,
-        vis_subject_ids=None,
-        vis_gt_view_indices=(2, 3, 15),
-        vis_src_view_idx=3,
-        vis_gt_enabled=True,
+        training_vis=None,
         **kwargs,
     ):
         kwargs.pop("lora_config_params", None)  # consumed by us
@@ -121,25 +77,16 @@ class TossLoraModule(TOSS):
         else:
             self.corr_flow_src_size = (int(src_size[0]), int(src_size[1]))
         self._corr_flow_warned = False
-        # Training-time multiview visualization (defaults match utils.inference.generate_batch)
-        self.vis_every_n_steps = int(kwargs.pop("vis_every_n_steps", vis_every_n_steps))
-        self.vis_yaws_deg = [float(y) for y in kwargs.pop("vis_yaws_deg", vis_yaws_deg)]
-        self.vis_ddim_steps = int(kwargs.pop("vis_ddim_steps", vis_ddim_steps))
-        self.vis_img_scale = float(kwargs.pop("vis_img_scale", vis_img_scale))
-        self.vis_prompt_scale = float(kwargs.pop("vis_prompt_scale", vis_prompt_scale))
-        self.vis_seed = int(kwargs.pop("vis_seed", vis_seed))
-        self.vis_image_size = int(kwargs.pop("vis_image_size", vis_image_size))
-        self.vis_precision = str(kwargs.pop("vis_precision", vis_precision))
-        self.vis_use_ema_scope = bool(kwargs.pop("vis_use_ema_scope", vis_use_ema_scope))
-        self.vis_source_image = kwargs.pop("vis_source_image", vis_source_image)
-        self.vis_source_mask = kwargs.pop("vis_source_mask", vis_source_mask)
-        self.vis_data_root = kwargs.pop("vis_data_root", vis_data_root)
-        subj_ids = kwargs.pop("vis_subject_ids", vis_subject_ids)
-        self.vis_subject_ids = [str(s) for s in subj_ids] if subj_ids else None
-        gt_indices = kwargs.pop("vis_gt_view_indices", vis_gt_view_indices)
-        self.vis_gt_view_indices = [int(v) for v in gt_indices] if gt_indices else []
-        self.vis_src_view_idx = int(kwargs.pop("vis_src_view_idx", vis_src_view_idx))
-        self.vis_gt_enabled = bool(kwargs.pop("vis_gt_enabled", vis_gt_enabled))
+
+        training_vis = kwargs.pop("training_vis", training_vis)
+        legacy_vis = [k for k in kwargs if k.startswith("vis_")]
+        if legacy_vis:
+            raise ValueError(
+                "Flat vis_* model params are no longer supported. "
+                f"Use nested training_vis instead (found: {sorted(legacy_vis)})."
+            )
+        install_training_vis_config(self, training_vis)
+
         super().__init__(*args, **kwargs)
         self._default_h = self.vis_image_size
         self._default_w = self.vis_image_size
@@ -275,14 +222,6 @@ class TossLoraModule(TOSS):
             return torch.cuda.amp.autocast(enabled=False)
         return nullcontext()
 
-    @property
-    def normal_estimator(self):
-        """Lazy-load frozen DPT-Hybrid normal estimator."""
-        if self._normal_estimator is None:
-            from ldm.modules.midas.api import DPTNormalInference
-            self._normal_estimator = DPTNormalInference(self.normal_estimator_path).to(self.device)
-            print(f"[INIT] Loaded DPT-Hybrid normal estimator from {self.normal_estimator_path}")
-        return self._normal_estimator
 
     @property
     def sampler(self):
@@ -317,34 +256,6 @@ class TossLoraModule(TOSS):
         if t.dim() == 3:
             t = t.unsqueeze(1)
         return t
-
-    def _debug_corr_grad(self, loss_corr, feat, corr_pred, p_tgt, p_src, valid_mask, numer):
-        """Walk the corr gradient chain (loss -> corr_pred -> p_tgt/p_src -> corr_proj) to find where it dies."""
-        step = int(self.global_step)
-        with torch.no_grad():
-            print(
-                f"[CORR-GRAD step={step}] "
-                f"feat(requires_grad={feat.requires_grad},grad_fn={feat.grad_fn is not None}) | "
-                f"loss(requires_grad={loss_corr.requires_grad},grad_fn={type(loss_corr.grad_fn).__name__ if loss_corr.grad_fn is not None else None}) | "
-                f"numer={numer.item():.6e} denom={valid_mask.sum().item():.4f} | "
-                f"valid_mask(n>0={int((valid_mask > 0).sum())},n>0.5={int((valid_mask > 0.5).sum())},"
-                f"numel={valid_mask.numel()},min={valid_mask.min().item():.4f},max={valid_mask.max().item():.4f})"
-            )
-
-        if not loss_corr.requires_grad:
-            print(f"[CORR-GRAD step={step}] loss_corr is detached -> no gradient path at all")
-            return
-
-        probe = [
-            ("d/dcorr_pred", corr_pred),
-            ("d/dp_tgt", p_tgt),
-            ("d/dp_src", p_src),
-            ("d/dfeat", feat),
-            ("d/dproj_w", self.corr_proj.weight),
-        ]
-        if self.corr_proj.bias is not None:
-            probe.append(("d/dproj_b", self.corr_proj.bias))
-        print(f"[CORR-GRAD step={step}] {_grad_probe(loss_corr, probe)}")
 
     def _compute_corr_loss(self, batch, x, src_kept=None, debug=False):
         """Correlation feature regularization on the captured last-output-block feature.
@@ -457,34 +368,7 @@ class TossLoraModule(TOSS):
                 f"and (x=width, y=height) channel order."
             )
 
-        if debug:
-            with torch.no_grad():
-                vm = valid_mask > 0.5
-                if vm.any():
-                    gt_valid = corr_gt[vm]
-                    gt_stats = (gt_valid.min().item(), gt_valid.mean().item(), gt_valid.max().item())
-                else:
-                    gt_stats = (float("nan"), float("nan"), float("nan"))
-                warped_norm = warped_src.norm(dim=1)  # [B, Hf, Wf]
-                print(
-                    f"[CORR-DEBUG step={int(self.global_step)}] "
-                    f"feat={tuple(feat.shape)} | "
-                    f"f_tgt(mean={f_tgt.mean().item():.4f},std={f_tgt.std().item():.4f}) "
-                    f"f_src(mean={f_src.mean().item():.4f},std={f_src.std().item():.4f}) | "
-                    f"grid(min={grid.min().item():.3f},max={grid.max().item():.3f},"
-                    f"in_bounds@valid={in_bounds_ratio.item():.4f}) | "
-                    f"warped_src_norm(mean={warped_norm.mean().item():.4f}) | "
-                    f"corr_pred(min={corr_pred.min().item():.4f},mean={corr_pred.mean().item():.4f},max={corr_pred.max().item():.4f}) | "
-                    f"corr_gt@valid(min={gt_stats[0]:.4f},mean={gt_stats[1]:.4f},max={gt_stats[2]:.4f}) | "
-                    f"valid_ratio={valid_mask.mean().item():.4f} | "
-                    f"loss_corr={loss_corr.item():.6f}"
-                )
-            self._debug_corr_grad(loss_corr, feat, corr_pred, p_tgt, p_src, valid_mask, numer)
-
         return loss_corr, log
-
-
-
 
     def _compute_batch_loss(self, batch, *, decode_mode="train"):
         """Shared train/val loss: masked MSE + optional corr, identity, DISTS."""

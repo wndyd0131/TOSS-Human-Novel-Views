@@ -171,3 +171,4 @@ wandb/
 notebooks/
 .DS_Store
 docs/
+.cursor/

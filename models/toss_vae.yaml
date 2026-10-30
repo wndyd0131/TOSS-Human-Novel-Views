@@ -123,16 +123,16 @@ model:
     dists_loss_weight: 0.00
     dists_t_cut: 200
 
-    # WandB multiview + GT recon (same subjects; utils.inference.generate_batch)
-    # Preferred: dataset root + subject folder ids (yaw sources = src view 3 per subject)
-    # vis_data_root: "/path/to/val"
-    # vis_subject_ids: ["081", "082"]
-    # vis_yaws_deg: [-15, -5, 5, 15]
-    # vis_gt_view_indices: [2, 3, 15]
-    # vis_src_view_idx: 3
-    # Or single subject via files (legacy):
-    # vis_source_image: "/path/to/val/081/00003.png"
-    # vis_source_mask: "/path/to/val/081/alpha_maps/00003.png"
+    # WandB multiview + GT recon (utils.inference.generate_batch). Set every_n_steps: 0 to disable.
+    # training_vis:
+    #   every_n_steps: 50
+    #   data_root: "/path/to/val"
+    #   subject_ids: ["081", "082"]
+    #   yaws_deg: [-15, -5, 5, 15]
+    #   gt_view_indices: [2, 3, 15]
+    #   src_view_idx: 3
+    #   source_image: null
+    #   source_mask: null
 
     scheduler_config: # 10000 warmup steps
       target: ldm.lr_scheduler.LambdaLinearScheduler

@@ -14,6 +14,60 @@ from PIL import Image
 if TYPE_CHECKING:
     from cldm.toss_lora import TossLoraModule
 
+TRAINING_VIS_DEFAULTS = {
+    "every_n_steps": 50,
+    "yaws_deg": (-15, -5, 5, 15),
+    "ddim_steps": 30,
+    "img_scale": 3.0,
+    "prompt_scale": 1.0,
+    "seed": 40,
+    "image_size": 256,
+    "precision": "autocast",
+    "use_ema_scope": False,
+    "source_image": None,
+    "source_mask": None,
+    "data_root": None,
+    "subject_ids": None,
+    "gt_view_indices": (2, 3, 15),
+    "src_view_idx": 3,
+    "gt_enabled": True,
+}
+
+
+def install_training_vis_config(module, training_vis: dict | None) -> None:
+    """Apply nested ``training_vis`` YAML dict to flat ``module.vis_*`` attributes."""
+    overrides = training_vis or {}
+    unknown = set(overrides) - set(TRAINING_VIS_DEFAULTS)
+    if unknown:
+        allowed = ", ".join(sorted(TRAINING_VIS_DEFAULTS))
+        raise ValueError(
+            f"Unknown training_vis key(s): {sorted(unknown)}. Allowed: {allowed}"
+        )
+
+    cfg = {**TRAINING_VIS_DEFAULTS, **overrides}
+    module.training_vis = cfg
+
+    module.vis_every_n_steps = int(cfg["every_n_steps"])
+    module.vis_yaws_deg = [float(y) for y in cfg["yaws_deg"]]
+    module.vis_ddim_steps = int(cfg["ddim_steps"])
+    module.vis_img_scale = float(cfg["img_scale"])
+    module.vis_prompt_scale = float(cfg["prompt_scale"])
+    module.vis_seed = int(cfg["seed"])
+    module.vis_image_size = int(cfg["image_size"])
+    module.vis_precision = str(cfg["precision"])
+    module.vis_use_ema_scope = bool(cfg["use_ema_scope"])
+    module.vis_source_image = cfg["source_image"]
+    module.vis_source_mask = cfg["source_mask"]
+    module.vis_data_root = cfg["data_root"]
+
+    subj_ids = cfg["subject_ids"]
+    module.vis_subject_ids = [str(s) for s in subj_ids] if subj_ids else None
+
+    gt_indices = cfg["gt_view_indices"]
+    module.vis_gt_view_indices = [int(v) for v in gt_indices] if gt_indices else []
+    module.vis_src_view_idx = int(cfg["src_view_idx"])
+    module.vis_gt_enabled = bool(cfg["gt_enabled"])
+
 
 def _normal_to_rgb_vis(norm):
     """Map unit normal field to RGB in [0,1] for visualization. norm: [B,3,H,W] or [3,H,W]."""
