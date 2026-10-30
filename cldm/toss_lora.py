@@ -185,51 +185,113 @@ class TossLoraModule(TOSS):
 
         self._training_vis = TossLoraTrainingVis(self)
 
-    def _decode_first_stage_train(self, z):
-        """Like ``decode_first_stage`` but without grad-disabled decorator so x0 gradients reach RGB."""
-        z = (1.0 / self.scale_factor) * z
-        return self.first_stage_model.decode(z)
+    # --- Lightning ---
 
-    def _gt_rgb_01_from_batch(self, batch):
-        """Target view RGB in [0, 1], CHW — same layout as ``TOSS.get_input`` before ``*2-1`` encode."""
-        x = batch[self.first_stage_key]
-        x = x.to(self.device)
-        if x.ndim == 4 and x.shape[-1] == 3:
-            x = einops.rearrange(x, "b h w c -> b c h w")
-        return x.clamp(0.0, 1.0)
+    def on_train_start(self):
+        """Called by PyTorch Lightning when training starts - log trainer config"""
+        self._trainable_params = [p for p in self.parameters() if p.requires_grad]
+        self._training_vis.prepare()
+        self._wandb.update_trainer(self, self.trainer)
 
-    def _ensure_arcface_backbone(self):
-        if self._arcface_backbone is None:
-            if not self.arcface_ckpt_path:
-                raise ValueError("identity_loss_weight > 0 requires arcface_ckpt_path to a backbone .pth")
-            self._arcface_backbone = create_frozen_arcface_backbone(self.arcface_ckpt_path).to(self.device)
-        self._arcface_backbone.eval()
-        return self._arcface_backbone
+    def training_step(self, batch, batch_idx):
+        self.model.diffusion_model.train()
 
-    def _ensure_dists(self):
-        if self._dists_model is None:
-            from DISTS_pytorch import DISTS
-            m = DISTS().to(self.device)
-            for p in m.parameters():
-                p.requires_grad_(False)
-            m.eval()
-            self._dists_model = m
-        self._dists_model.eval()
-        return self._dists_model
+        if hasattr(self.model.diffusion_model, "enable_adapters"):
+            self.model.diffusion_model.enable_adapters()
 
-    def _identity_autocast_ctx(self):
-        if self.device.type == "cuda":
-            return torch.cuda.amp.autocast(enabled=False)
-        return nullcontext()
+        loss, log_dict, mse_for_grad, corr_loss, dists_loss = self._compute_batch_loss(
+            batch, decode_mode="train"
+        )
 
+        wandb_log = dict(log_dict)
+        append_grad_diagnostics(wandb_log, self, mse_for_grad, corr_loss, dists_loss)
+        maybe_log_training_vis(
+            self._training_vis, batch, wandb_log, int(self.global_step)
+        )
+        self._wandb.log_train(wandb_log, int(self.global_step), loss.item())
 
-    @property
-    def sampler(self):
-        """Lazy DDIM sampler for ``generate_batch`` (WandB preview)."""
-        if self._sampler is None:
-            from ldm.models.diffusion.ddim import DDIMSampler
-            self._sampler = DDIMSampler(self)
-        return self._sampler
+        self.log("train_loss", loss, prog_bar=True, logger=True)
+        return loss
+
+    @torch.no_grad()
+    def validation_step(self, batch, batch_idx):
+        loss, log_dict, _, _, _ = self._compute_batch_loss(batch, decode_mode="eval")
+        val_logs = {f"val/{k}": v for k, v in log_dict.items()}
+        self.log_dict(
+            val_logs,
+            prog_bar=True,
+            logger=True,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        return loss
+
+    def on_validation_epoch_end(self):
+        if self.trainer is None:
+            return
+        self._wandb.log_validation(self.trainer.callback_metrics, int(self.global_step))
+
+    def configure_optimizers(self):
+        # Explicitly collect LoRA and pose_net params separately
+        lora_params = []
+        finetune_params = []
+        other_params = []
+        
+        # Use named_parameters to ensure we get the actual parameter objects
+        for n, p in self.model.diffusion_model.named_parameters():
+            if p.requires_grad:
+                if "lora" in n.lower():
+                    lora_params.append(p)
+                    print(f"[OPT] LoRA param: {n}, shape={p.shape}")
+                elif "pose_net" in n:
+                    finetune_params.append(p)
+                    print(f"[OPT] pose_net param: {n}, shape={p.shape}")
+                elif "vae_proj" in n:
+                    finetune_params.append(p)
+                elif "base_model.model.out." in n:
+                    finetune_params.append(p)
+                else:
+                    other_params.append(p)
+                    print(f"[OPT] Other param: {n}, shape={p.shape}")
+        
+        print(f"\n[OPT] Summary:")
+        print(f"  LoRA params: {len(lora_params)}")
+        print(f"  finetune params: {len(finetune_params)}")
+        print(f"  Other trainable params: {len(other_params)}")
+        print(f"  Total params in optimizer: {len(lora_params) + len(finetune_params) + len(other_params)}")
+        
+        if len(lora_params) == 0:
+            print("[WARNING] No LoRA params found! Check if PEFT is properly configured.")
+            # Fallback: try to get params differently
+            for n, p in self.named_parameters():
+                if "lora" in n.lower() and p.requires_grad:
+                    lora_params.append(p)
+                    print(f"[OPT-FALLBACK] Found LoRA param: {n}")
+        
+        # Use separate param groups with different learning rates
+        # pose_net uses lower LR (0.1x) for gentle fine-tuning
+        param_groups = [
+            {"params": lora_params, "lr": self.learning_rate, "name": "lora"},
+        ]
+
+        if len(finetune_params) > 0:
+            param_groups.append({"params": finetune_params, "lr": self.learning_rate * 0.1, "name": "finetune"})
+        if len(other_params) > 0:
+            param_groups.append({"params": other_params, "lr": self.learning_rate, "name": "other"})
+
+        # corr_proj lives on the LightningModule (not under diffusion_model), so add it explicitly.
+        # Skip when frozen so we can ablate the projection layer without touching this loss.
+        corr_params = [p for p in self.corr_proj.parameters() if p.requires_grad]
+        if len(corr_params) > 0:
+            param_groups.append({"params": corr_params, "lr": self.learning_rate, "name": "corr_proj"})
+            print(f"[OPT] corr_proj params: {len(corr_params)}")
+        else:
+            print("[OPT] corr_proj frozen (not added to optimizer)")
+
+        optimizer = torch.optim.AdamW(param_groups)
+        
+        return optimizer
 
     def on_save_checkpoint(self, checkpoint):
         # We override this to prevent the parent class from 
@@ -240,22 +302,158 @@ class TossLoraModule(TOSS):
         # checkpoint["state_dict"] = {k: v for k, v in checkpoint["state_dict"].items() if "lora" in k or "pose_net" in k}
         pass
 
+    # --- Public API ---
+
     def set_vis_sources(self, images, names=None, subject_ids=None):
         """Fix the source faces used for training-time multiview visualization."""
         return self._training_vis.set_vis_sources(images, names=names, subject_ids=subject_ids)
 
-    def on_train_start(self):
-        """Called by PyTorch Lightning when training starts - log trainer config"""
-        self._trainable_params = [p for p in self.parameters() if p.requires_grad]
-        self._training_vis.prepare()
-        self._wandb.update_trainer(self, self.trainer)
+    @property
+    def sampler(self):
+        """Lazy DDIM sampler for ``generate_batch`` (WandB preview)."""
+        if self._sampler is None:
+            from ldm.models.diffusion.ddim import DDIMSampler
+            self._sampler = DDIMSampler(self)
+        return self._sampler
 
-    @staticmethod
-    def _as_bchw(t):
-        """Ensure a per-location map is [B, 1, H, W]. Accepts [B, H, W] or [B, 1, H, W]."""
-        if t.dim() == 3:
-            t = t.unsqueeze(1)
-        return t
+    # --- Loss ---
+
+    def _compute_batch_loss(self, batch, *, decode_mode="train"):
+        """Shared train/val loss: masked MSE + optional corr, identity, DISTS."""
+        # Forward: latent diffusion step (noise prediction)
+        x, cond = self.get_input(batch, self.first_stage_key)
+        src_kept = cond["in_concat"][0].flatten(1).abs().sum(dim=1) > 0  # [B] bool
+
+        t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
+        noise = torch.randn_like(x)
+        x_noisy = self.q_sample(x_start=x, t=t, noise=noise)
+        model_output = self.apply_model(x_noisy, t, cond)
+
+        # Base loss: MSE on noise (optionally face-weighted in latent space)
+        mse_loss = F.mse_loss(model_output, noise, reduction="mean")
+
+        mask = batch.get("mask")
+        masked_mse_loss = None
+        if mask is not None:
+            mask = mask.to(self.device)
+            soft_mask = mask * (1.0 - self.mask_min_weight) + self.mask_min_weight
+            latent_mask = F.interpolate(soft_mask, size=model_output.shape[-2:], mode="area")
+            masked_mse_loss = (
+                F.mse_loss(model_output, noise, reduction="none") * latent_mask
+            ).sum() / latent_mask.sum()
+            loss = self.mse_weight * masked_mse_loss
+        else:
+            loss = mse_loss
+
+        identity_loss = None
+        dists_loss = None
+        d_img = None
+        d_sobel = None
+        corr_loss = None
+        corr_log = {}
+
+        # Optional: correlation feature regularization (UNet hook + batch flow/GT)
+        if self.lambda_corr > 0.0:
+            debug_corr = (
+                decode_mode == "train"
+                and int(self.global_step) < self.corr_debug_steps
+            )
+            corr_loss, corr_log = self._compute_corr_loss(
+                batch, x, src_kept=src_kept, debug=debug_corr
+            )
+            if corr_loss is not None:
+                loss = loss + self.lambda_corr * corr_loss
+
+        need_identity = self.identity_loss_weight > 0.0
+        need_dists = self.dists_loss_weight > 0.0
+
+        # Optional: RGB-space losses on x0 (low-t samples only; shared decode path)
+        if need_identity or need_dists:
+            union_cut = max(
+                self.identity_t_cut if need_identity else 0,
+                self.dists_t_cut if need_dists else 0,
+            )
+            sel = t < union_cut
+            if torch.any(sel):
+                x0_pred = self.predict_start_from_noise(
+                    x_noisy[sel], t[sel], model_output[sel]
+                )
+                if decode_mode == "train":
+                    pred_img = self._decode_first_stage_train(x0_pred)
+                else:
+                    pred_img = self.decode_first_stage(x0_pred)
+                pred_rgb = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
+                gt_rgb = self._gt_rgb_01_from_batch(batch)[sel]
+                t_sel = t[sel]
+
+                # ArcFace cosine identity
+                if need_identity:
+                    sub = t_sel < self.identity_t_cut
+                    if torch.any(sub):
+                        pred_rgb_id = pred_rgb[sub]
+                        gt_rgb_id = gt_rgb[sub]
+
+                        backbone = self._ensure_arcface_backbone()
+                        with self._identity_autocast_ctx():
+                            pred_arc = preprocess_arcface_input(
+                                pred_rgb_id.float(),
+                                spatial_mode=self.arcface_spatial_mode,
+                            )
+                            gt_arc = preprocess_arcface_input(
+                                gt_rgb_id.float().detach(),
+                                spatial_mode=self.arcface_spatial_mode,
+                            )
+                            emb_pred = F.normalize(backbone(pred_arc), dim=-1)
+                            emb_gt = F.normalize(backbone(gt_arc), dim=-1).detach()
+                        identity_loss = (1.0 - (emb_pred * emb_gt).sum(dim=-1)).mean()
+                        loss = loss + self.identity_loss_weight * identity_loss
+
+                # DISTS on RGB + Sobel edges
+                if need_dists:
+                    sub = t_sel < self.dists_t_cut
+                    if torch.any(sub):
+                        pred_rgb_d = pred_rgb[sub].float()
+                        gt_rgb_d = gt_rgb[sub].float().detach()
+
+                        dists_model = self._ensure_dists()
+                        require_grad = decode_mode == "train"
+                        d_img = dists_model(
+                            pred_rgb_d, gt_rgb_d,
+                            require_grad=require_grad,
+                            batch_average=True,
+                        )
+
+                        pred_sobel = _grayscale_sobel_3ch(pred_rgb_d)
+                        gt_sobel = _grayscale_sobel_3ch(gt_rgb_d).detach()
+                        d_sobel = dists_model(
+                            pred_sobel, gt_sobel,
+                            require_grad=require_grad,
+                            batch_average=True,
+                        )
+
+                        dists_loss = d_img + d_sobel
+                        loss = loss + self.dists_loss_weight * dists_loss
+
+        mse_for_grad = masked_mse_loss if masked_mse_loss is not None else mse_loss
+
+        # Scalars for Lightning / WandB
+        log_dict = {
+            "loss": loss,
+            "mse_loss": mse_loss,
+        }
+        if masked_mse_loss is not None:
+            log_dict["masked_mse_loss"] = masked_mse_loss
+        if identity_loss is not None:
+            log_dict["identity_loss"] = identity_loss
+        if dists_loss is not None:
+            log_dict["dists_loss"] = dists_loss
+            log_dict["dists_loss_img"] = d_img
+            log_dict["dists_loss_sobel"] = d_sobel
+        if corr_loss is not None:
+            log_dict.update(corr_log)
+            log_dict["weighted_corr_loss"] = self.lambda_corr * corr_loss
+
+        return loss, log_dict, mse_for_grad, corr_loss, dists_loss
 
     def _compute_corr_loss(self, batch, x, src_kept=None, debug=False):
         """Correlation feature regularization on the captured last-output-block feature.
@@ -370,232 +568,48 @@ class TossLoraModule(TOSS):
 
         return loss_corr, log
 
-    def _compute_batch_loss(self, batch, *, decode_mode="train"):
-        """Shared train/val loss: masked MSE + optional corr, identity, DISTS."""
-        x, cond = self.get_input(batch, self.first_stage_key)
-        src_kept = cond["in_concat"][0].flatten(1).abs().sum(dim=1) > 0  # [B] bool
+    @staticmethod
+    def _as_bchw(t):
+        """Ensure a per-location map is [B, 1, H, W]. Accepts [B, H, W] or [B, 1, H, W]."""
+        if t.dim() == 3:
+            t = t.unsqueeze(1)
+        return t
 
-        t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
-        noise = torch.randn_like(x)
-        x_noisy = self.q_sample(x_start=x, t=t, noise=noise)
-        model_output = self.apply_model(x_noisy, t, cond)
+    # --- Loss helpers (RGB / ArcFace / DISTS) ---
 
-        mse_loss = F.mse_loss(model_output, noise, reduction="mean")
+    def _decode_first_stage_train(self, z):
+        """Like ``decode_first_stage`` but without grad-disabled decorator so x0 gradients reach RGB."""
+        z = (1.0 / self.scale_factor) * z
+        return self.first_stage_model.decode(z)
 
-        mask = batch.get("mask")
-        masked_mse_loss = None
-        if mask is not None:
-            mask = mask.to(self.device)
-            soft_mask = mask * (1.0 - self.mask_min_weight) + self.mask_min_weight
-            latent_mask = F.interpolate(soft_mask, size=model_output.shape[-2:], mode="area")
-            masked_mse_loss = (
-                F.mse_loss(model_output, noise, reduction="none") * latent_mask
-            ).sum() / latent_mask.sum()
-            loss = self.mse_weight * masked_mse_loss
-        else:
-            loss = mse_loss
+    def _gt_rgb_01_from_batch(self, batch):
+        """Target view RGB in [0, 1], CHW — same layout as ``TOSS.get_input`` before ``*2-1`` encode."""
+        x = batch[self.first_stage_key]
+        x = x.to(self.device)
+        if x.ndim == 4 and x.shape[-1] == 3:
+            x = einops.rearrange(x, "b h w c -> b c h w")
+        return x.clamp(0.0, 1.0)
 
-        identity_loss = None
-        dists_loss = None
-        d_img = None
-        d_sobel = None
-        corr_loss = None
-        corr_log = {}
+    def _ensure_arcface_backbone(self):
+        if self._arcface_backbone is None:
+            if not self.arcface_ckpt_path:
+                raise ValueError("identity_loss_weight > 0 requires arcface_ckpt_path to a backbone .pth")
+            self._arcface_backbone = create_frozen_arcface_backbone(self.arcface_ckpt_path).to(self.device)
+        self._arcface_backbone.eval()
+        return self._arcface_backbone
 
-        if self.lambda_corr > 0.0:
-            debug_corr = (
-                decode_mode == "train"
-                and int(self.global_step) < self.corr_debug_steps
-            )
-            corr_loss, corr_log = self._compute_corr_loss(
-                batch, x, src_kept=src_kept, debug=debug_corr
-            )
-            if corr_loss is not None:
-                loss = loss + self.lambda_corr * corr_loss
+    def _identity_autocast_ctx(self):
+        if self.device.type == "cuda":
+            return torch.cuda.amp.autocast(enabled=False)
+        return nullcontext()
 
-        need_identity = self.identity_loss_weight > 0.0
-        need_dists = self.dists_loss_weight > 0.0
-
-        if need_identity or need_dists:
-            union_cut = max(
-                self.identity_t_cut if need_identity else 0,
-                self.dists_t_cut if need_dists else 0,
-            )
-            sel = t < union_cut
-            if torch.any(sel):
-                x0_pred = self.predict_start_from_noise(
-                    x_noisy[sel], t[sel], model_output[sel]
-                )
-                if decode_mode == "train":
-                    pred_img = self._decode_first_stage_train(x0_pred)
-                else:
-                    pred_img = self.decode_first_stage(x0_pred)
-                pred_rgb = torch.clamp((pred_img + 1.0) / 2.0, 0.0, 1.0)
-                gt_rgb = self._gt_rgb_01_from_batch(batch)[sel]
-                t_sel = t[sel]
-
-                if need_identity:
-                    sub = t_sel < self.identity_t_cut
-                    if torch.any(sub):
-                        pred_rgb_id = pred_rgb[sub]
-                        gt_rgb_id = gt_rgb[sub]
-
-                        backbone = self._ensure_arcface_backbone()
-                        with self._identity_autocast_ctx():
-                            pred_arc = preprocess_arcface_input(
-                                pred_rgb_id.float(),
-                                spatial_mode=self.arcface_spatial_mode,
-                            )
-                            gt_arc = preprocess_arcface_input(
-                                gt_rgb_id.float().detach(),
-                                spatial_mode=self.arcface_spatial_mode,
-                            )
-                            emb_pred = F.normalize(backbone(pred_arc), dim=-1)
-                            emb_gt = F.normalize(backbone(gt_arc), dim=-1).detach()
-                        identity_loss = (1.0 - (emb_pred * emb_gt).sum(dim=-1)).mean()
-                        loss = loss + self.identity_loss_weight * identity_loss
-
-                if need_dists:
-                    sub = t_sel < self.dists_t_cut
-                    if torch.any(sub):
-                        pred_rgb_d = pred_rgb[sub].float()
-                        gt_rgb_d = gt_rgb[sub].float().detach()
-
-                        dists_model = self._ensure_dists()
-                        require_grad = decode_mode == "train"
-                        d_img = dists_model(
-                            pred_rgb_d, gt_rgb_d,
-                            require_grad=require_grad,
-                            batch_average=True,
-                        )
-
-                        pred_sobel = _grayscale_sobel_3ch(pred_rgb_d)
-                        gt_sobel = _grayscale_sobel_3ch(gt_rgb_d).detach()
-                        d_sobel = dists_model(
-                            pred_sobel, gt_sobel,
-                            require_grad=require_grad,
-                            batch_average=True,
-                        )
-
-                        dists_loss = d_img + d_sobel
-                        loss = loss + self.dists_loss_weight * dists_loss
-
-        mse_for_grad = masked_mse_loss if masked_mse_loss is not None else mse_loss
-
-        log_dict = {
-            "loss": loss,
-            "mse_loss": mse_loss,
-        }
-        if masked_mse_loss is not None:
-            log_dict["masked_mse_loss"] = masked_mse_loss
-        if identity_loss is not None:
-            log_dict["identity_loss"] = identity_loss
-        if dists_loss is not None:
-            log_dict["dists_loss"] = dists_loss
-            log_dict["dists_loss_img"] = d_img
-            log_dict["dists_loss_sobel"] = d_sobel
-        if corr_loss is not None:
-            log_dict.update(corr_log)
-            log_dict["weighted_corr_loss"] = self.lambda_corr * corr_loss
-
-        return loss, log_dict, mse_for_grad, corr_loss, dists_loss
-
-    @torch.no_grad()
-    def validation_step(self, batch, batch_idx):
-        loss, log_dict, _, _, _ = self._compute_batch_loss(batch, decode_mode="eval")
-        val_logs = {f"val/{k}": v for k, v in log_dict.items()}
-        self.log_dict(
-            val_logs,
-            prog_bar=True,
-            logger=True,
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-        )
-        return loss
-
-    def on_validation_epoch_end(self):
-        if self.trainer is None:
-            return
-        self._wandb.log_validation(self.trainer.callback_metrics, int(self.global_step))
-
-    def training_step(self, batch, batch_idx):
-        self.model.diffusion_model.train()
-
-        if hasattr(self.model.diffusion_model, "enable_adapters"):
-            self.model.diffusion_model.enable_adapters()
-
-        loss, log_dict, mse_for_grad, corr_loss, dists_loss = self._compute_batch_loss(
-            batch, decode_mode="train"
-        )
-
-        wandb_log = dict(log_dict)
-        append_grad_diagnostics(wandb_log, self, mse_for_grad, corr_loss, dists_loss)
-        maybe_log_training_vis(
-            self._training_vis, batch, wandb_log, int(self.global_step)
-        )
-        self._wandb.log_train(wandb_log, int(self.global_step), loss.item())
-
-        self.log("train_loss", loss, prog_bar=True, logger=True)
-        return loss
-
-    def configure_optimizers(self):
-        # Explicitly collect LoRA and pose_net params separately
-        lora_params = []
-        finetune_params = []
-        other_params = []
-        
-        # Use named_parameters to ensure we get the actual parameter objects
-        for n, p in self.model.diffusion_model.named_parameters():
-            if p.requires_grad:
-                if "lora" in n.lower():
-                    lora_params.append(p)
-                    print(f"[OPT] LoRA param: {n}, shape={p.shape}")
-                elif "pose_net" in n:
-                    finetune_params.append(p)
-                    print(f"[OPT] pose_net param: {n}, shape={p.shape}")
-                elif "vae_proj" in n:
-                    finetune_params.append(p)
-                elif "base_model.model.out." in n:
-                    finetune_params.append(p)
-                else:
-                    other_params.append(p)
-                    print(f"[OPT] Other param: {n}, shape={p.shape}")
-        
-        print(f"\n[OPT] Summary:")
-        print(f"  LoRA params: {len(lora_params)}")
-        print(f"  finetune params: {len(finetune_params)}")
-        print(f"  Other trainable params: {len(other_params)}")
-        print(f"  Total params in optimizer: {len(lora_params) + len(finetune_params) + len(other_params)}")
-        
-        if len(lora_params) == 0:
-            print("[WARNING] No LoRA params found! Check if PEFT is properly configured.")
-            # Fallback: try to get params differently
-            for n, p in self.named_parameters():
-                if "lora" in n.lower() and p.requires_grad:
-                    lora_params.append(p)
-                    print(f"[OPT-FALLBACK] Found LoRA param: {n}")
-        
-        # Use separate param groups with different learning rates
-        # pose_net uses lower LR (0.1x) for gentle fine-tuning
-        param_groups = [
-            {"params": lora_params, "lr": self.learning_rate, "name": "lora"},
-        ]
-
-        if len(finetune_params) > 0:
-            param_groups.append({"params": finetune_params, "lr": self.learning_rate * 0.1, "name": "finetune"})
-        if len(other_params) > 0:
-            param_groups.append({"params": other_params, "lr": self.learning_rate, "name": "other"})
-
-        # corr_proj lives on the LightningModule (not under diffusion_model), so add it explicitly.
-        # Skip when frozen so we can ablate the projection layer without touching this loss.
-        corr_params = [p for p in self.corr_proj.parameters() if p.requires_grad]
-        if len(corr_params) > 0:
-            param_groups.append({"params": corr_params, "lr": self.learning_rate, "name": "corr_proj"})
-            print(f"[OPT] corr_proj params: {len(corr_params)}")
-        else:
-            print("[OPT] corr_proj frozen (not added to optimizer)")
-
-        optimizer = torch.optim.AdamW(param_groups)
-        
-        return optimizer
+    def _ensure_dists(self):
+        if self._dists_model is None:
+            from DISTS_pytorch import DISTS
+            m = DISTS().to(self.device)
+            for p in m.parameters():
+                p.requires_grad_(False)
+            m.eval()
+            self._dists_model = m
+        self._dists_model.eval()
+        return self._dists_model
