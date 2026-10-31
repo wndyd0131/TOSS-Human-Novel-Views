@@ -159,6 +159,28 @@ def get_T_from_relative_deg(
     raise NotImplementedError(pose_enc)
 
 
+def _finalize_spherical_delta(
+    delta: np.ndarray,
+    pose_enc: str = "freq",
+) -> np.ndarray:
+    """
+    Apply human / TOSS pose_net yaw convention on top of vanilla spherical deltas.
+
+    Vanilla ``get_T_delta_w2c`` azimuth is negated on the yaw channel only.
+    """
+    delta = np.asarray(delta, dtype=np.float64).copy()
+    if pose_enc in ("freq", "identity"):
+        delta[1] = _wrap_angle(-float(delta[1]))
+        return delta.astype(np.float32)
+    if pose_enc == "zero":
+        azimuth = math.atan2(float(delta[1]), float(delta[2]))
+        azimuth = _wrap_angle(-azimuth)
+        delta[1] = math.sin(azimuth)
+        delta[2] = math.cos(azimuth)
+        return delta.astype(np.float32)
+    raise NotImplementedError(pose_enc)
+
+
 def relative_delta_pose(
     src_c2w: np.ndarray,
     tgt_c2w: np.ndarray,
@@ -170,6 +192,8 @@ def relative_delta_pose(
     Unified delta for training / eval / vis.
 
     ``src_c2w``, ``tgt_c2w``: camera-to-world (``poses.npy``).
+
+    ``spherical``: vanilla w2c spherical delta + yaw negation for human multiview GT.
     """
     mode = validate_pose_delta_mode(mode)
     if mode == "rotation":
@@ -183,8 +207,7 @@ def relative_delta_pose(
     if pose_enc in ("freq", "identity"):
         delta = delta.astype(np.float64)
         delta[1] = _wrap_angle(float(delta[1]))
-        return delta.astype(np.float32)
-    return delta.astype(np.float32)
+    return _finalize_spherical_delta(delta, pose_enc=pose_enc)
 
 
 def _rotation_from_pitch_yaw(pitch: float, yaw: float) -> np.ndarray:
@@ -234,12 +257,13 @@ def delta_pose_for_yaw_degrees(
     mode = validate_pose_delta_mode(mode)
     if mode == "spherical":
         del src_pose_4x4
-        return get_T_from_relative_deg(
+        delta = get_T_from_relative_deg(
             delta_pitch_deg,
             yaw_deg,
             delta_dist,
             pose_enc=pose_enc,
         )
+        return _finalize_spherical_delta(delta, pose_enc=pose_enc)
 
     src_pose_4x4 = np.asarray(src_pose_4x4, dtype=np.float32)
     tgt_pose = synthesize_target_pose(

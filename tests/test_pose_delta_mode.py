@@ -34,14 +34,16 @@ def test_validate_pose_delta_mode_rejects_unknown():
         raise AssertionError("expected ValueError")
 
 
-def test_spherical_yaw_sweep_matches_from_relative_deg():
+def test_spherical_yaw_sweep_negates_yaw_vs_from_relative_deg():
     delta = pose.delta_pose_for_yaw_degrees(
         np.eye(4, dtype=np.float32),
         15.0,
         mode="spherical",
     )
-    expected = pose.get_T_from_relative_deg(0.0, 15.0, 0.0)
+    raw = pose.get_T_from_relative_deg(0.0, 15.0, 0.0)
+    expected = pose._finalize_spherical_delta(raw, pose_enc="freq")
     np.testing.assert_allclose(delta, expected, rtol=0, atol=1e-6)
+    assert float(delta[1]) < 0.0
 
 
 def test_relative_delta_pose_modes_on_c2w_poses():
@@ -56,6 +58,8 @@ def test_relative_delta_pose_modes_on_c2w_poses():
     assert rot.shape == (3,) and sph.shape == (3,)
     assert not np.allclose(rot, sph, atol=1e-4)
     assert -math.pi <= float(sph[1]) <= math.pi
+    if float(rot[1]) != 0.0:
+        assert math.copysign(1.0, float(rot[1])) == math.copysign(1.0, float(sph[1]))
 
 
 def test_c2w_matches_inv_world2cam():
@@ -85,7 +89,7 @@ def test_c2w_matches_inv_world2cam():
 
 if __name__ == "__main__":
     test_validate_pose_delta_mode_rejects_unknown()
-    test_spherical_yaw_sweep_matches_from_relative_deg()
+    test_spherical_yaw_sweep_negates_yaw_vs_from_relative_deg()
     test_relative_delta_pose_modes_on_c2w_poses()
     test_c2w_matches_inv_world2cam()
     print("tests/test_pose_delta_mode.py: ok")

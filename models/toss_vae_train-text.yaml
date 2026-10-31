@@ -179,7 +179,8 @@ model:
     finetune: True
     ucg_img: 0.05
 
-    # Delta pose from poses.npy (c2w): rotation (Portrait4D) | spherical (vanilla TOSS / w2c via inv)
+    # Delta pose from poses.npy (c2w): rotation (Portrait4D) | spherical (vanilla TOSS + yaw flip)
+    # After switching to spherical, re-check WandB GT recon (pred vs GT facing same way).
     pose_delta_mode: rotation
 
     lambda_corr: 0.0
