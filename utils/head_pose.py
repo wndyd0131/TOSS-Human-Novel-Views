@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 
 from utils.image import ImageInput, to_numpy_rgb
-from utils.pose import compute_relative_pose
+from utils.pose import relative_delta_pose, validate_pose_delta_mode
 
 
 _SIXDREPNET_MODULE_NAMES = (
@@ -157,17 +157,23 @@ def compute_pose_errors(
 def calibrate_pose_estimator_on_gt(
     estimator: HeadPoseEstimator,
     samples: Sequence[tuple[np.ndarray, ImageInput, ImageInput, int, int]],
+    pose_delta_mode: str = "rotation",
 ) -> PoseCalibrationStats:
     """
     Fit estimator yaw deltas against ``poses.npy`` GT deltas.
 
     Each sample is ``(poses, src_img, tgt_img, src_view_idx, tgt_view_idx)``.
     """
+    pose_delta_mode = validate_pose_delta_mode(pose_delta_mode)
     gt_deltas: list[float] = []
     est_deltas: list[float] = []
 
     for poses, src_img, tgt_img, src_idx, tgt_idx in samples:
-        delta = compute_relative_pose(poses[src_idx], poses[tgt_idx])
+        delta = relative_delta_pose(
+            poses[src_idx],
+            poses[tgt_idx],
+            mode=pose_delta_mode,
+        )
         gt_deltas.append(float(np.degrees(delta[1])))
         est_deltas.append(estimator.relative_yaw(tgt_img, src_img))
 

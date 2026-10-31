@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import math
 from typing import Sequence
 
 import numpy as np
 
 DEFAULT_RECON_VIEW_INDICES = (0, 1, 2, 3, 8, 12, 13, 15)
+POSE_DELTA_MODES = ("rotation", "spherical")
 
 
 def rotation_matrix_to_euler(R: np.ndarray) -> tuple[float, float]:
@@ -47,8 +49,10 @@ def compute_relative_pose(
     tgt_pose_4x4: np.ndarray,
 ) -> np.ndarray:
     """
-    Relative [delta_pitch, delta_yaw, delta_distance] in radians.
-    Nersemble yaw sign is flipped to match Portrait4D/TOSS convention.
+    Relative [delta_pitch, delta_yaw, delta_distance] in radians (rotation mode).
+
+    Expects **camera-to-world (c2w)** 4×4 matrices (``poses.npy`` convention).
+    Do not pass NeRSemble ``world_2_cam`` without inverting first.
     """
     src_pitch, src_yaw = rotation_matrix_to_euler(src_pose_4x4[:3, :3])
     tgt_pitch, tgt_yaw = rotation_matrix_to_euler(tgt_pose_4x4[:3, :3])
@@ -63,6 +67,124 @@ def compute_relative_pose(
         [delta_pitch, delta_yaw, tgt_dist - src_dist],
         dtype=np.float32,
     )
+
+
+def validate_pose_delta_mode(mode: str) -> str:
+    mode = str(mode)
+    if mode not in POSE_DELTA_MODES:
+        raise ValueError(
+            f"pose_delta_mode must be one of {POSE_DELTA_MODES}, got {mode!r}"
+        )
+    return mode
+
+
+def c2w_to_w2c(c2w: np.ndarray) -> np.ndarray:
+    """Invert a c2w extrinsic to world-to-camera."""
+    return np.linalg.inv(np.asarray(c2w, dtype=np.float64))
+
+
+def cartesian_to_spherical(xyz: np.ndarray) -> np.ndarray:
+    """Spherical coords: theta (from +Z), azimuth (atan2 y,x), radius."""
+    xyz = np.asarray(xyz, dtype=np.float64)
+    if xyz.ndim == 1:
+        xyz = xyz.reshape(1, -1)
+    xy = xyz[:, 0] ** 2 + xyz[:, 1] ** 2
+    z = np.sqrt(xy + xyz[:, 2] ** 2)
+    theta = np.arctan2(np.sqrt(xy), xyz[:, 2])
+    azimuth = np.arctan2(xyz[:, 1], xyz[:, 0])
+    return np.array([theta, azimuth, z], dtype=np.float64)
+
+
+def cam_center_world_from_w2c(w2c: np.ndarray) -> np.ndarray:
+    """World-space camera center from 4×4 world-to-camera."""
+    w2c = np.asarray(w2c, dtype=np.float64)
+    R = w2c[:3, :3]
+    t = w2c[:3, 3]
+    return (-R.T @ t).astype(np.float64)
+
+
+def get_T_delta_w2c(
+    target_w2c: np.ndarray,
+    cond_w2c: np.ndarray,
+    pose_enc: str = "freq",
+) -> np.ndarray:
+    """
+    Vanilla TOSS delta from w2c extrinsics: [d_theta, d_azimuth, d_z] in radians.
+
+    ``pose_enc`` ``zero`` returns 4-vector [d_theta, sin(d_azimuth), cos(d_azimuth), d_z].
+    """
+    T_target = cam_center_world_from_w2c(target_w2c)
+    T_cond = cam_center_world_from_w2c(cond_w2c)
+
+    theta_cond, azimuth_cond, z_cond = cartesian_to_spherical(T_cond)
+    theta_target, azimuth_target, z_target = cartesian_to_spherical(T_target)
+
+    d_theta = float((theta_target - theta_cond).item())
+    d_azimuth = float(((azimuth_target - azimuth_cond) % (2 * math.pi)).item())
+    d_z = float((z_target - z_cond).item())
+
+    if pose_enc in ("freq", "identity"):
+        return np.array([d_theta, d_azimuth, d_z], dtype=np.float64)
+    if pose_enc == "zero":
+        return np.array(
+            [d_theta, math.sin(d_azimuth), math.cos(d_azimuth), d_z],
+            dtype=np.float64,
+        )
+    raise NotImplementedError(pose_enc)
+
+
+def get_T_from_relative_deg(
+    x_deg: float,
+    y_deg: float,
+    z: float,
+    pose_enc: str = "freq",
+) -> np.ndarray:
+    """Manual relative pose in degrees → model delta (radians for angles)."""
+    if pose_enc in ("freq", "identity"):
+        return np.array(
+            [math.radians(x_deg), math.radians(y_deg), float(z)],
+            dtype=np.float32,
+        )
+    if pose_enc == "zero":
+        y_rad = math.radians(y_deg)
+        return np.array(
+            [
+                math.radians(x_deg),
+                math.sin(y_rad),
+                math.cos(y_rad),
+                float(z),
+            ],
+            dtype=np.float32,
+        )
+    raise NotImplementedError(pose_enc)
+
+
+def relative_delta_pose(
+    src_c2w: np.ndarray,
+    tgt_c2w: np.ndarray,
+    *,
+    mode: str = "rotation",
+    pose_enc: str = "freq",
+) -> np.ndarray:
+    """
+    Unified delta for training / eval / vis.
+
+    ``src_c2w``, ``tgt_c2w``: camera-to-world (``poses.npy``).
+    """
+    mode = validate_pose_delta_mode(mode)
+    if mode == "rotation":
+        return compute_relative_pose(src_c2w, tgt_c2w)
+
+    delta = get_T_delta_w2c(
+        c2w_to_w2c(tgt_c2w),
+        c2w_to_w2c(src_c2w),
+        pose_enc=pose_enc,
+    )
+    if pose_enc in ("freq", "identity"):
+        delta = delta.astype(np.float64)
+        delta[1] = _wrap_angle(float(delta[1]))
+        return delta.astype(np.float32)
+    return delta.astype(np.float32)
 
 
 def _rotation_from_pitch_yaw(pitch: float, yaw: float) -> np.ndarray:
@@ -104,8 +226,21 @@ def delta_pose_for_yaw_degrees(
     yaw_deg: float,
     delta_pitch_deg: float = 0.0,
     delta_dist: float = 0.0,
+    *,
+    mode: str = "rotation",
+    pose_enc: str = "freq",
 ) -> np.ndarray:
     """Training-format ``[Δpitch, Δyaw, Δdist]`` (rad) for a yaw sweep from ``src_pose``."""
+    mode = validate_pose_delta_mode(mode)
+    if mode == "spherical":
+        del src_pose_4x4
+        return get_T_from_relative_deg(
+            delta_pitch_deg,
+            yaw_deg,
+            delta_dist,
+            pose_enc=pose_enc,
+        )
+
     src_pose_4x4 = np.asarray(src_pose_4x4, dtype=np.float32)
     tgt_pose = synthesize_target_pose(
         src_pose_4x4,
@@ -154,15 +289,23 @@ def select_horizontal_views(
     src_view_idx: int,
     *,
     pitch_threshold_deg: float = 15.0,
+    mode: str = "rotation",
+    pose_enc: str = "freq",
 ) -> list[int]:
     """Return non-source views with small relative pitch, sorted by relative yaw."""
+    mode = validate_pose_delta_mode(mode)
     num_views = len(poses)
     selected: list[tuple[float, int]] = []
 
     for view_idx in range(num_views):
         if view_idx == src_view_idx:
             continue
-        delta = compute_relative_pose(poses[src_view_idx], poses[view_idx])
+        delta = relative_delta_pose(
+            poses[src_view_idx],
+            poses[view_idx],
+            mode=mode,
+            pose_enc=pose_enc,
+        )
         pitch_deg = abs(float(np.degrees(delta[0])))
         if pitch_deg <= pitch_threshold_deg:
             yaw_deg = float(np.degrees(delta[1]))

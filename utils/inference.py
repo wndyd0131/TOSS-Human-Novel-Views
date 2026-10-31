@@ -230,7 +230,7 @@ def generate_batch(
 ) -> list[Image.Image]:
     """
     Batch novel-view generation. Each entry in ``delta_pose_list`` is training-format
-    ``[delta_pitch, delta_yaw, delta_distance]`` in radians (see ``compute_relative_pose``).
+    ``[delta_pitch, delta_yaw, delta_distance]`` in radians (see ``relative_delta_pose``).
     """
     del n_samples, img_ucg  # kept for API compatibility
 
@@ -350,7 +350,7 @@ class TossInference:
     ) -> Union[Image.Image, list[Image.Image]]:
         """
         Novel view synthesis. Pass ``delta_pose`` (single, rad) or ``delta_pose_list``
-        (batch). Use ``utils.pose.compute_relative_pose`` upstream to build deltas.
+        (batch). Use ``utils.pose.relative_delta_pose`` upstream to build deltas.
         """
         if delta_pose_list is not None:
             images = generate_batch(

@@ -26,12 +26,16 @@ from utils.image import normalize_mask, preprocess_image, resize_mask, to_numpy_
 from utils.inference import TossInference, generate_batch
 from utils.pose import (
     DEFAULT_RECON_VIEW_INDICES,
+    POSE_DELTA_MODES,
     compute_relative_pose,
+    get_T_from_relative_deg,
     identity_dy_grid,
     pose_matrix_to_toss_format,
+    relative_delta_pose,
     rotation_matrix_to_euler,
     select_horizontal_views,
     select_recon_views,
+    validate_pose_delta_mode,
 )
 from utils.toss_human_dataset import TossHumanDataset
 
@@ -55,7 +59,9 @@ __all__ = [
     "compute_psnr",
     "load_ply_vertices",
     "resolve_fused_ply",
+    "POSE_DELTA_MODES",
     "compute_relative_pose",
+    "get_T_from_relative_deg",
     "identity_dy_grid",
     "load_eval_checkpoint",
     "print_batch_eval_summary",
@@ -66,8 +72,10 @@ __all__ = [
     "normalize_mask",
     "pose_matrix_to_toss_format",
     "preprocess_image",
+    "relative_delta_pose",
     "resize_mask",
     "rotation_matrix_to_euler",
+    "validate_pose_delta_mode",
     "select_horizontal_views",
     "select_recon_views",
     "to_numpy_rgb",

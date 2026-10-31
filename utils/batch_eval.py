@@ -25,11 +25,12 @@ from utils.inference import generate_batch
 from utils.multiview_metrics import MultiviewMetricsEvaluator
 from utils.pose import (
     DEFAULT_RECON_VIEW_INDICES,
-    compute_relative_pose,
     delta_pose_for_yaw_degrees,
     identity_dy_grid,
+    relative_delta_pose,
     select_horizontal_views,
     select_recon_views,
+    validate_pose_delta_mode,
 )
 
 
@@ -454,6 +455,7 @@ def _build_run_eval_config(
     identity_num_yaws: int,
     metrics_config: dict[str, bool],
     gen_seed: int | None = None,
+    pose_delta_mode: str = "rotation",
 ) -> dict[str, Any]:
     return _normalize_eval_config(
         {
@@ -464,6 +466,7 @@ def _build_run_eval_config(
             "identity_num_yaws": identity_num_yaws,
             "metrics_config": dict(metrics_config),
             "gen_seed": gen_seed,
+            "pose_delta_mode": validate_pose_delta_mode(pose_delta_mode),
         }
     )
 
@@ -818,8 +821,11 @@ def _record_gt_references(
     src_input: Image.Image,
     mv_evaluator: MultiviewMetricsEvaluator,
     gt_calib_samples: list[tuple[np.ndarray, Image.Image, Image.Image, int, int]],
+    pose_delta_mode: str = "rotation",
 ) -> None:
-    horiz_views = select_horizontal_views(poses, src_view_idx)
+    horiz_views = select_horizontal_views(
+        poses, src_view_idx, mode=pose_delta_mode
+    )
     if len(horiz_views) < 2:
         return
 
@@ -830,7 +836,11 @@ def _record_gt_references(
     for view_idx in horiz_views:
         gt_img, gt_mask = _load_subject_rgba(sub_path, view_idx)
         gt_pil = _preprocessed_pil(gt_img, gt_mask)
-        delta = compute_relative_pose(poses[src_view_idx], poses[view_idx])
+        delta = relative_delta_pose(
+            poses[src_view_idx],
+            poses[view_idx],
+            mode=pose_delta_mode,
+        )
         gt_yaws.append(float(np.degrees(delta[1])))
         gt_images.append(gt_pil)
         gt_masks.append(gt_mask)
@@ -1131,6 +1141,7 @@ def run_batch_eval(
     mv_evaluator: MultiviewMetricsEvaluator | None = None,
     pose_estimator: HeadPoseEstimator | None = None,
     gen_seed: int | None = 42,
+    pose_delta_mode: str = "rotation",
 ) -> BatchEvalResults:
     """
     Generate novel views per subject and evaluate with metrics_evaluator.
@@ -1146,7 +1157,7 @@ def run_batch_eval(
 
     Reconstruction track (PSNR / LPIPS):
         Fixed upper-ring GT view indices (``recon_view_indices``), excluding
-        ``src_view_idx``. Full 3DOF ``compute_relative_pose`` per view vs GT.
+        ``src_view_idx``. Full 3DOF ``relative_delta_pose`` per view vs GT.
         Overall mean is a micro-average over all eval (subject, view) pairs.
 
     Identity track:
@@ -1181,6 +1192,7 @@ def run_batch_eval(
 
     gt_calib_samples: list[tuple[np.ndarray, Image.Image, Image.Image, int, int]] = []
 
+    pose_delta_mode = validate_pose_delta_mode(pose_delta_mode)
     run_eval_config = _build_run_eval_config(
         src_view_idx=src_view_idx,
         recon_view_indices=recon_view_indices,
@@ -1189,6 +1201,7 @@ def run_batch_eval(
         identity_num_yaws=identity_num_yaws,
         metrics_config=metrics_config,
         gen_seed=gen_seed,
+        pose_delta_mode=pose_delta_mode,
     )
     if eval_config is not None:
         run_eval_config.update(_normalize_eval_config(eval_config))
@@ -1274,9 +1287,10 @@ def run_batch_eval(
             else:
                 recon_meta: list[tuple[int, float, np.ndarray]] = []
                 for view_idx in recon_views:
-                    delta = compute_relative_pose(
+                    delta = relative_delta_pose(
                         poses[src_view_idx],
                         poses[view_idx],
+                        mode=pose_delta_mode,
                     )
                     yaw_key = _yaw_key(float(np.degrees(delta[1])))
                     recon_meta.append((view_idx, yaw_key, delta.astype(np.float32)))
@@ -1331,7 +1345,11 @@ def run_batch_eval(
 
         if run_sweep:
             delta_pose_list = [
-                delta_pose_for_yaw_degrees(poses[src_view_idx], yaw_deg)
+                delta_pose_for_yaw_degrees(
+                    poses[src_view_idx],
+                    yaw_deg,
+                    mode=pose_delta_mode,
+                )
                 for yaw_deg in dy_grid
             ]
             id_pils = _generate_batch(
@@ -1411,6 +1429,7 @@ def run_batch_eval(
                 src_input,
                 mv_evaluator,
                 gt_calib_samples,
+                pose_delta_mode=pose_delta_mode,
             )
 
         completed_subjects.append(subject)
@@ -1432,7 +1451,11 @@ def run_batch_eval(
                 )
 
     if run_gt_refs and gt_calib_samples and pose_estimator is not None:
-        calib = calibrate_pose_estimator_on_gt(pose_estimator, gt_calib_samples)
+        calib = calibrate_pose_estimator_on_gt(
+            pose_estimator,
+            gt_calib_samples,
+            pose_delta_mode=pose_delta_mode,
+        )
         results.metadata["pose_estimator_gt_mae_deg"] = calib.mae_deg
         results.metadata["pose_estimator_gt_slope"] = calib.slope
         results.metadata["pose_estimator_gt_intercept"] = calib.intercept

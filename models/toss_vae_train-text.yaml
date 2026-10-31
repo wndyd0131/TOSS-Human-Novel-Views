@@ -179,6 +179,9 @@ model:
     finetune: True
     ucg_img: 0.05
 
+    # Delta pose from poses.npy (c2w): rotation (Portrait4D) | spherical (vanilla TOSS / w2c via inv)
+    pose_delta_mode: rotation
+
     lambda_corr: 0.0
     corr_flow_src_size: 32
 
@@ -206,6 +209,7 @@ model:
     #   src_view_idx: 3
     #   source_image: null
     #   source_mask: null
+    #   pose_delta_mode: null  # inherit model pose_delta_mode
 
     scheduler_config: # 10000 warmup steps
       target: ldm.lr_scheduler.LambdaLinearScheduler

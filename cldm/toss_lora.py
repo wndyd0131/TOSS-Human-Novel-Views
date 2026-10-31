@@ -14,6 +14,7 @@ from cldm.toss_lora_vis import (
     install_training_vis_config,
     maybe_log_training_vis,
 )
+from utils.pose import validate_pose_delta_mode
 # CRITICAL FIX: Completely disable gradient checkpointing to fix LoRA gradient flow
 # The custom CheckpointFunction doesn't properly handle PEFT's dynamically added parameters
 import ldm.modules.diffusionmodules.util as ldm_util
@@ -51,9 +52,13 @@ class TossLoraModule(TOSS):
         corr_debug_steps=200,
         corr_flow_src_size=32,
         training_vis=None,
+        pose_delta_mode: str = "rotation",
         **kwargs,
     ):
         kwargs.pop("lora_config_params", None)  # consumed by us
+        self.pose_delta_mode = validate_pose_delta_mode(
+            kwargs.pop("pose_delta_mode", pose_delta_mode)
+        )
         self.normal_estimator_path = kwargs.pop("normal_estimator_path", normal_estimator_path)
         self.geometry_loss_weight = kwargs.pop("geometry_loss_weight", geometry_loss_weight)
         self.identity_loss_weight = float(kwargs.pop("identity_loss_weight", identity_loss_weight))

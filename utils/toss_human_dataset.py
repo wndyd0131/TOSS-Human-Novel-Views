@@ -10,7 +10,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms as T
 
 from utils.image import preprocess_image
-from utils.pose import compute_relative_pose
+from utils.pose import relative_delta_pose, validate_pose_delta_mode
 
 
 def preprocess_normal_for_cosine(
@@ -134,8 +134,10 @@ class TossHumanDataset(Dataset):
         image_size=256,
         caption_filename="caption.txt",
         load_caption=True,
+        pose_delta_mode: str = "rotation",
     ):
         super().__init__()
+        self.pose_delta_mode = validate_pose_delta_mode(pose_delta_mode)
         self.root_dir = root_dir
         self.transform = transform
         self.image_size = int(image_size)
@@ -293,13 +295,15 @@ class TossHumanDataset(Dataset):
 
         poses = self._cache.get_poses(sub_path)
 
-        delta_pose = compute_relative_pose(
+        delta_pose = relative_delta_pose(
             poses[self.src_view_idx],
             poses[sample["view_index"]],
+            mode=self.pose_delta_mode,
         )
-        assert abs(delta_pose[1]) < 1.0, (
-            f"Yaw {delta_pose[1]} seems too large - check units!"
-        )
+        if self.pose_delta_mode == "rotation":
+            assert abs(delta_pose[1]) < 1.0, (
+                f"Yaw {delta_pose[1]} seems too large - check units!"
+            )
         delta_pose = torch.from_numpy(delta_pose).float()
 
         src = preprocess_image(src, fg_mask=src_mask, size=self.image_size)

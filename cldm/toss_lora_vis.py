@@ -31,6 +31,7 @@ TRAINING_VIS_DEFAULTS = {
     "gt_view_indices": (2, 3, 15),
     "src_view_idx": 3,
     "gt_enabled": True,
+    "pose_delta_mode": None,
 }
 
 
@@ -67,6 +68,12 @@ def install_training_vis_config(module, training_vis: dict | None) -> None:
     module.vis_gt_view_indices = [int(v) for v in gt_indices] if gt_indices else []
     module.vis_src_view_idx = int(cfg["src_view_idx"])
     module.vis_gt_enabled = bool(cfg["gt_enabled"])
+    vis_mode = cfg["pose_delta_mode"]
+    if vis_mode is None:
+        vis_mode = getattr(module, "pose_delta_mode", "rotation")
+    from utils.pose import validate_pose_delta_mode
+
+    module.vis_pose_delta_mode = validate_pose_delta_mode(vis_mode)
 
 
 def _normal_to_rgb_vis(norm):
@@ -124,7 +131,7 @@ class TossLoraTrainingVis:
     def _gt_items_for_subject_dir(self, subject_dir: str):
         """Return list of (view_idx, delta, gt_pil, gt_mask) for one subject folder."""
         from utils.image import preprocess_image
-        from utils.pose import compute_relative_pose
+        from utils.pose import relative_delta_pose
 
         m = self.m
         poses = self._load_poses_npy(subject_dir)
@@ -154,7 +161,11 @@ class TossLoraTrainingVis:
                 print(f"[VIS][WARN] view_idx={view_idx} out of range for {subject_dir}; skip.")
                 continue
 
-            delta = compute_relative_pose(poses[src_idx], poses[view_idx]).astype(np.float32)
+            delta = relative_delta_pose(
+                poses[src_idx],
+                poses[view_idx],
+                mode=m.vis_pose_delta_mode,
+            ).astype(np.float32)
             gt_img = Image.open(img_path).convert("RGBA")
             gt_mask = Image.open(mask_path).convert("L")
             gt_arr = preprocess_image(gt_img, fg_mask=gt_mask, size=m.vis_image_size)
@@ -366,7 +377,11 @@ class TossLoraTrainingVis:
                         continue
                     src_pose = poses[src_idx]
                     delta_pose_list = [
-                        delta_pose_for_yaw_degrees(src_pose, yaw_deg)
+                        delta_pose_for_yaw_degrees(
+                            src_pose,
+                            yaw_deg,
+                            mode=m.vis_pose_delta_mode,
+                        )
                         for yaw_deg in m.vis_yaws_deg
                     ]
                     preds = generate_batch(
